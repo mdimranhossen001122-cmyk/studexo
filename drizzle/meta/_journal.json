@@ -1,0 +1,34 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1794627776841,
+      "tag": "0000_init_studexo_mvp",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1794627784611,
+      "tag": "0001_studexo_integrity_triggers_and_extensions",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794627792000,
+      "tag": "0002_studexo_user_insert_and_file_rollback_guards",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794627800000,
+      "tag": "0003_studexo_schema_lockout_and_outbox_guard",
+      "breakpoints": true
+    }
+  ]
+}

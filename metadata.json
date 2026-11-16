@@ -1,0 +1,6 @@
+{
+  "name": "Studexo",
+  "description": "Global higher-education admissions, guidance, and readiness platform for students in Bangladesh and India.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

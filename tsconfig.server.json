@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "lib": ["ES2022"],
+    "paths": {
+      "@server/*": ["./src/server/*"],
+      "@shared/*": ["./src/shared/*"]
+    }
+  },
+  "include": [
+    "server.ts",
+    "vite.config.ts",
+    "vitest.config.ts",
+    "drizzle.config.ts",
+    "src/server/**/*.ts",
+    "src/shared/**/*.ts",
+    "tests/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist", "src/client"]
+}
