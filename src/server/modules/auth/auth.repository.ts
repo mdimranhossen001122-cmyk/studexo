@@ -126,6 +126,74 @@ export function deriveEmailProvisionLockId(primaryEmail: string): {
 }
 
 
+export type InsertedUserRow = {
+  id: string;
+  supabaseAuthUserId: string | null;
+  primaryEmail: string;
+  displayName: string | null;
+  role: AuthenticatedUser['role'];
+  status: AuthenticatedUser['status'];
+  purgeState: UserRecordWithIdentities['user']['purgeState'];
+  deletionRequestedAt: Date | string | null;
+  deletionScheduledFor: Date | string | null;
+};
+
+/**
+ * Builds the strict 4-column parameterized INSERT on `studexo.users` permitted for `studexo_app`.
+ * Deliberately omits all restricted/defaulted columns (`role`, `status`, `purge_state`, timestamps, etc.)
+ * because Drizzle's `.insert(users).values({...})` emits all 16 columns with `DEFAULT`, which
+ * PostgreSQL rejects with SQLSTATE `42501` under column-level INSERT privileges.
+ */
+export function buildInsertUserFourColumnQuery(params: {
+  id: string;
+  supabaseAuthUserId: string;
+  primaryEmail: string;
+  displayName: string | null;
+}) {
+  return sql<InsertedUserRow>`
+    INSERT INTO studexo.users (
+      id,
+      supabase_auth_user_id,
+      primary_email,
+      display_name
+    )
+    VALUES (
+      ${params.id}::uuid,
+      ${params.supabaseAuthUserId}::uuid,
+      ${params.primaryEmail},
+      ${params.displayName}
+    )
+    RETURNING
+      id,
+      supabase_auth_user_id AS "supabaseAuthUserId",
+      primary_email AS "primaryEmail",
+      display_name AS "displayName",
+      role,
+      status,
+      purge_state AS "purgeState",
+      deletion_requested_at AS "deletionRequestedAt",
+      deletion_scheduled_for AS "deletionScheduledFor"
+  `;
+}
+
+function extractFirstRow<T>(result: unknown): T | undefined {
+  if (Array.isArray(result)) {
+    return result[0] as T | undefined;
+  }
+  return (result as { rows?: T[] } | null | undefined)?.rows?.[0];
+}
+
+function normalizeNullableDate(value: Date | string | null | undefined): Date | null {
+  if (value == null) {
+    return null;
+  }
+  if (value instanceof Date) {
+    return value;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 export class PostgresAuthRepository implements AuthRepository {
   constructor(private readonly db: StudexoDatabase) {}
 
@@ -311,7 +379,7 @@ export class PostgresAuthRepository implements AuthRepository {
       sql`SELECT studexo.is_auth_user_pending_purge(${normalizedAuthId}::uuid) AS is_pending_purge;`,
     );
 
-    const firstRow = Array.isArray(result) ? result[0] : (result as unknown as { rows?: Array<{ is_pending_purge: boolean }> })?.rows?.[0];
+    const firstRow = extractFirstRow<{ is_pending_purge: boolean }>(result);
     return Boolean(firstRow?.is_pending_purge);
   }
 
@@ -400,11 +468,7 @@ export class PostgresAuthRepository implements AuthRepository {
       const purgeResult = await tx.execute<{ is_pending_purge: boolean }>(
         sql`SELECT studexo.is_auth_user_pending_purge(${normalizedAuthId}::uuid) AS is_pending_purge;`,
       );
-      const isPurging = Boolean(
-        Array.isArray(purgeResult)
-          ? purgeResult[0]?.is_pending_purge
-          : (purgeResult as unknown as { rows?: Array<{ is_pending_purge: boolean }> })?.rows?.[0]?.is_pending_purge,
-      );
+      const isPurging = Boolean(extractFirstRow<{ is_pending_purge: boolean }>(purgeResult)?.is_pending_purge);
 
       if (isPurging) {
         throw new AuthError(
@@ -458,7 +522,7 @@ export class PostgresAuthRepository implements AuthRepository {
       }
 
       // 6. Strict least-privilege INSERT on studexo.users (ONLY 4 COLUMNS: id, supabase_auth_user_id, primary_email, display_name)
-      // Never specify role, status, or purgeState in values({...}); let PostgreSQL schema defaults take effect!
+      // Never list role, status, purgeState, or timestamps in the INSERT column list; let PostgreSQL schema defaults apply.
       const newUserId = crypto.randomUUID();
 
       // Enforce the database schema's 160-character display-name limit defensively (Unicode code points)
@@ -467,25 +531,15 @@ export class PostgresAuthRepository implements AuthRepository {
           ? truncateToUnicodeChars(params.displayName.trim(), 160)
           : null;
 
-      const [newUserRow] = await tx
-        .insert(users)
-        .values({
+      const insertUserResult = await tx.execute<InsertedUserRow>(
+        buildInsertUserFourColumnQuery({
           id: newUserId,
           supabaseAuthUserId: normalizedAuthId,
           primaryEmail: normalizedEmail,
           displayName: trimmedDisplayName,
-        })
-        .returning({
-          id: users.id,
-          supabaseAuthUserId: users.supabaseAuthUserId,
-          primaryEmail: users.primaryEmail,
-          displayName: users.displayName,
-          role: users.role,
-          status: users.status,
-          purgeState: users.purgeState,
-          deletionRequestedAt: users.deletionRequestedAt,
-          deletionScheduledFor: users.deletionScheduledFor,
-        });
+        }),
+      );
+      const newUserRow = extractFirstRow<InsertedUserRow>(insertUserResult);
 
       if (!newUserRow || !newUserRow.supabaseAuthUserId) {
         throw new AuthError('AUTH_PROVISIONING_FAILED', 'Failed to create user record in studexo.users.', {
@@ -539,8 +593,8 @@ export class PostgresAuthRepository implements AuthRepository {
           role: newUserRow.role,
           status: newUserRow.status,
           purgeState: newUserRow.purgeState,
-          deletionRequestedAt: newUserRow.deletionRequestedAt,
-          deletionScheduledFor: newUserRow.deletionScheduledFor,
+          deletionRequestedAt: normalizeNullableDate(newUserRow.deletionRequestedAt),
+          deletionScheduledFor: normalizeNullableDate(newUserRow.deletionScheduledFor),
         },
         identities: createdIdentities,
         settings: initialSettings,

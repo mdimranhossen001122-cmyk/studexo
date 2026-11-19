@@ -133,6 +133,7 @@ describe.skipIf(!TEST_POSTGRES_URL)(
         GRANT EXECUTE ON FUNCTION studexo.is_auth_user_pending_purge(uuid) TO studexo_purge_owner;
 
         -- Step 6: exact studexo_app privileges from docs/DATABASE_ROLES.md
+        REVOKE CREATE ON SCHEMA studexo FROM PUBLIC, studexo_app, studexo_purge_worker, studexo_purge_owner, studexo_catalog_admin;
         GRANT USAGE ON SCHEMA studexo TO studexo_app;
         REVOKE ALL ON studexo.users FROM PUBLIC, studexo_app;
         GRANT SELECT ON studexo.users TO studexo_app;
@@ -151,6 +152,7 @@ describe.skipIf(!TEST_POSTGRES_URL)(
           updated_at
         ) ON studexo.users TO studexo_app;
 
+        REVOKE ALL ON FUNCTION studexo.is_auth_user_pending_purge(uuid) FROM PUBLIC;
         GRANT EXECUTE ON FUNCTION studexo.is_auth_user_pending_purge(uuid) TO studexo_app;
         GRANT SELECT, INSERT, UPDATE, DELETE ON
           studexo.auth_identities,
@@ -221,6 +223,38 @@ describe.skipIf(!TEST_POSTGRES_URL)(
       const found = await appRepo.findUserBySupabaseAuthId(sub);
       expect(found).not.toBeNull();
       expect(found?.user.id).toBe(result.user.id);
+
+      // Verify nullable display_name works cleanly on the 4-column INSERT
+      const nullNameSub = crypto.randomUUID();
+      const nullNameEmail = `nullname_${Date.now()}@studexo.example.com`;
+      const nullNameResult = await appRepo.provisionUserAtomic({
+        supabaseAuthUserId: nullNameSub,
+        primaryEmail: nullNameEmail,
+        displayName: null,
+        identities: [
+          {
+            provider: 'supabase_email',
+            providerSubject: nullNameSub,
+            emailAtProvider: nullNameEmail,
+            emailVerified: true,
+          },
+        ],
+      });
+      expect(nullNameResult.user.displayName).toBeNull();
+      expect(nullNameResult.user.role).toBe('student');
+    });
+
+    it('enforces least-privilege boundary: studexo_app INSERT naming restricted columns fails with SQLSTATE 42501', async () => {
+      let capturedCode: string | undefined;
+      try {
+        await appSql`
+          INSERT INTO studexo.users (id, supabase_auth_user_id, primary_email, display_name, role)
+          VALUES (${crypto.randomUUID()}::uuid, ${crypto.randomUUID()}::uuid, ${`blocked_${Date.now()}@studexo.example.com`}, 'Blocked', 'student')
+        `;
+      } catch (err) {
+        capturedCode = (err as { code?: string }).code;
+      }
+      expect(capturedCode).toBe('42501');
     });
 
     it('guarantees email concurrency safety: simultaneous first-logins from different UUIDs for the same email serialize and reject collision', async () => {

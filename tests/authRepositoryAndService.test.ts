@@ -1,10 +1,15 @@
+import { is, SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
+import type { StudexoDatabase } from '../src/server/db/client';
 import { AuthError, type AuthoritativeUserPayload, type AuthTokenClaims } from '../src/shared/types/auth';
 import {
+  buildInsertUserFourColumnQuery,
   deriveEmailProvisionLockId,
   deriveUserProvisionLockId,
   normalizeAuthSub,
   normalizeEmail,
+  PostgresAuthRepository,
   truncateToUnicodeChars,
   type AuthRepository,
   type ProvisionUserParams,
@@ -656,6 +661,147 @@ describe('Phase 8B.5A Milestone 2 — Authoritative Identity Resolution, Anti-Co
       expect(repo.capturedInserts).toHaveLength(1); // not called again!
       expect(repo.lastSignInUpdates).toHaveLength(1);
       expect(repo.lastSignInUpdates[0]!.userId).toBe(firstSync.user.id);
+    });
+  });
+
+  describe('PostgresAuthRepository Strict 4-Column studexo.users INSERT Verification', () => {
+    it('buildInsertUserFourColumnQuery emits ONLY the 4 permitted columns without DEFAULT or restricted columns', () => {
+      const dialect = new PgDialect();
+      const query = buildInsertUserFourColumnQuery({
+        id: '11111111-1111-4111-8111-111111111111',
+        supabaseAuthUserId: SUB_1,
+        primaryEmail: EMAIL_1,
+        displayName: 'Least Privilege Student',
+      });
+
+      const compiled = dialect.sqlToQuery(query);
+      const insertMatch = compiled.sql.match(/INSERT INTO studexo\.users\s*\(([\s\S]*?)\)\s*VALUES\s*\(([\s\S]*?)\)\s*RETURNING/i);
+      expect(insertMatch).not.toBeNull();
+
+      const insertColumns = insertMatch![1]!
+        .split(',')
+        .map((c) => c.trim().replace(/"/g, ''));
+      const insertValues = insertMatch![2]!
+        .split(',')
+        .map((v) => v.trim());
+
+      expect(insertColumns).toEqual([
+        'id',
+        'supabase_auth_user_id',
+        'primary_email',
+        'display_name',
+      ]);
+      expect(insertValues).toEqual(['$1::uuid', '$2::uuid', '$3', '$4']);
+      expect(compiled.sql).not.toMatch(/\bVALUES\b[\s\S]*\bDEFAULT\b/i);
+      expect(compiled.params).toEqual([
+        '11111111-1111-4111-8111-111111111111',
+        SUB_1,
+        EMAIL_1,
+        'Least Privilege Student',
+      ]);
+    });
+
+    it('PostgresAuthRepository.provisionUserAtomic executes the 4-column INSERT and maps DB defaults cleanly (including nullable displayName)', async () => {
+      const dialect = new PgDialect();
+      const executedQueries: Array<{ sql: string; params: unknown[] }> = [];
+      const insertedTables: Array<{ table: string; sql: string; params: unknown[] }> = [];
+
+      const createSelectChain = () => ({
+        from: () => ({
+          where: () => ({
+            limit: async () => [],
+          }),
+        }),
+      });
+
+      const fakeTx = {
+        execute: async (query: SQL<unknown>) => {
+          const compiled = dialect.sqlToQuery(query);
+          executedQueries.push(compiled);
+
+          if (compiled.sql.includes('is_auth_user_pending_purge')) {
+            return [{ is_pending_purge: false }];
+          }
+          if (compiled.sql.includes('INSERT INTO studexo.users')) {
+            return [
+              {
+                id: compiled.params[0],
+                supabaseAuthUserId: compiled.params[1],
+                primaryEmail: compiled.params[2],
+                displayName: compiled.params[3],
+                role: 'student',
+                status: 'active',
+                purgeState: 'none',
+                deletionRequestedAt: null,
+                deletionScheduledFor: null,
+              },
+            ];
+          }
+          return [];
+        },
+        select: () => createSelectChain(),
+        insert: (table: unknown) => ({
+          values: async (vals: Record<string, unknown>) => {
+            const tableName =
+              typeof table === 'object' && table !== null && Symbol.for('drizzle:Name') in table
+                ? String((table as Record<symbol, unknown>)[Symbol.for('drizzle:Name')])
+                : 'unknown';
+            insertedTables.push({
+              table: tableName,
+              sql: `insert:${tableName}`,
+              params: Object.values(vals),
+            });
+            return [];
+          },
+        }),
+      };
+
+      const fakeDb = {
+        transaction: async (fn: (tx: typeof fakeTx) => Promise<unknown>) => fn(fakeTx),
+      } as unknown as StudexoDatabase;
+
+      const repo = new PostgresAuthRepository(fakeDb);
+      const provisioned = await repo.provisionUserAtomic({
+        supabaseAuthUserId: SUB_1.toUpperCase(),
+        primaryEmail: `  ${EMAIL_1.toUpperCase()}  `,
+        displayName: null,
+        identities: [
+          {
+            provider: 'supabase_email',
+            providerSubject: SUB_1,
+            emailAtProvider: EMAIL_1,
+            emailVerified: true,
+          },
+        ],
+      });
+
+      expect(provisioned.user.supabaseAuthUserId).toBe(SUB_1);
+      expect(provisioned.user.primaryEmail).toBe(EMAIL_1);
+      expect(provisioned.user.displayName).toBeNull();
+      expect(provisioned.user.role).toBe('student');
+      expect(provisioned.user.status).toBe('active');
+      expect(provisioned.user.purgeState).toBe('none');
+      expect(provisioned.user.deletionRequestedAt).toBeNull();
+      expect(provisioned.user.deletionScheduledFor).toBeNull();
+
+      // Advisory locks + purge check + 4-column INSERT
+      const userInsertQuery = executedQueries.find((q) => q.sql.includes('INSERT INTO studexo.users'));
+      expect(userInsertQuery).toBeDefined();
+      const colMatch = userInsertQuery!.sql.match(/INSERT INTO studexo\.users\s*\(([\s\S]*?)\)\s*VALUES/i);
+      const cols = colMatch![1]!.split(',').map((c) => c.trim());
+      expect(cols).toEqual(['id', 'supabase_auth_user_id', 'primary_email', 'display_name']);
+      expect(userInsertQuery!.params[1]).toBe(SUB_1);
+      expect(userInsertQuery!.params[2]).toBe(EMAIL_1);
+      expect(userInsertQuery!.params[3]).toBeNull();
+
+      // Confirms identities and account_settings still insert through Drizzle
+      expect(insertedTables.map((t) => t.table)).toEqual(['auth_identities', 'account_settings']);
+      expect(is(buildInsertUserFourColumnQuery({
+        id: provisioned.user.id,
+        supabaseAuthUserId: SUB_1,
+        primaryEmail: EMAIL_1,
+        displayName: null,
+      }), SQL)).toBe(true);
     });
   });
 });
