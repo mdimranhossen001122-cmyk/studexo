@@ -56,6 +56,7 @@ export interface AuthMiddlewarePipeline {
   authenticateBearerClaims: RequestHandler;
   requireAuthoritativeSession: RequestHandler;
   resolveDatabaseUser: RequestHandler;
+  getAuthService: () => AuthService;
   requireAuth: RequestHandler[];
   requireRole: (...allowedRoles: StudexoUserRole[]) => RequestHandler;
   requireAuthRole: (...allowedRoles: StudexoUserRole[]) => RequestHandler[];
@@ -106,6 +107,24 @@ function isTransientDatabaseError(err: unknown): boolean {
     return isTransientDatabaseError(cause);
   }
   return false;
+}
+
+/**
+ * Translates database configuration and transient connectivity failures into
+ * structured AuthError (500) or AppError (503), preserving domain errors as-is.
+ */
+export function mapDatabaseErrorToHttpError(err: unknown): unknown {
+  if (err instanceof DatabaseNotConfiguredError) {
+    return new AuthError(
+      'AUTH_CONFIGURATION_ERROR',
+      'Database configuration is missing for identity resolution.',
+      { statusCode: 500 },
+    );
+  }
+  if (isTransientDatabaseError(err)) {
+    return new AppError(503, 'DATABASE_UNAVAILABLE', 'Database service is temporarily unavailable');
+  }
+  return err;
 }
 
 /**
@@ -210,21 +229,7 @@ export function createAuthMiddlewarePipeline(deps: {
       next();
     })().catch((err: unknown) => {
       req.user = undefined;
-      if (err instanceof DatabaseNotConfiguredError) {
-        next(
-          new AuthError(
-            'AUTH_CONFIGURATION_ERROR',
-            'Database configuration is missing for identity resolution.',
-            { statusCode: 500 },
-          ),
-        );
-        return;
-      }
-      if (isTransientDatabaseError(err)) {
-        next(new AppError(503, 'DATABASE_UNAVAILABLE', 'Database service is temporarily unavailable'));
-        return;
-      }
-      next(err);
+      next(mapDatabaseErrorToHttpError(err));
     });
   };
 
@@ -298,6 +303,7 @@ export function createAuthMiddlewarePipeline(deps: {
     authenticateBearerClaims,
     requireAuthoritativeSession,
     resolveDatabaseUser,
+    getAuthService: deps.getAuthService,
     requireAuth,
     requireRole,
     requireAuthRole,

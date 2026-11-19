@@ -18,6 +18,7 @@ import {
   createCorsMiddleware,
   createHelmetMiddleware,
 } from './middleware/security';
+import { createAuthRouter } from './modules/auth/auth.routes';
 import {
   createHealthRouter,
   type DatabaseReadinessProbe,
@@ -73,6 +74,7 @@ export function createApp(options: CreateAppOptions = {}): AppContext {
       checkDatabaseReadiness: options.checkDatabaseReadiness,
     }),
   );
+  app.use('/api/auth', createAuthRouter({ authMiddleware }));
   app.use('/api', apiRouter);
   app.use('/api', apiNotFoundHandler);
 

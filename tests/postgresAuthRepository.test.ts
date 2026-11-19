@@ -16,7 +16,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres, { type Sql } from 'postgres';
+import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { createApp } from '../src/server/app';
+import { parseEnv } from '../src/server/config/env';
 import type { StudexoDatabase } from '../src/server/db/client';
 import * as schema from '../src/server/db/schema/index';
 import {
@@ -24,6 +27,8 @@ import {
   type AuthRepository,
   type ProvisionUserParams,
 } from '../src/server/modules/auth/auth.repository';
+import { createAuthService } from '../src/server/modules/auth/auth.service';
+import { MockTokenVerifier } from '../src/server/modules/auth/tokenVerifier';
 import { AuthError } from '../src/shared/types/auth';
 
 const TEST_POSTGRES_URL = process.env.TEST_POSTGRES_URL?.trim();
@@ -388,6 +393,101 @@ describe.skipIf(!TEST_POSTGRES_URL)(
       // Exactly 160 Unicode code points (PostgreSQL varchar(160) limit)
       expect(Array.from(result.user.displayName!)).toHaveLength(160);
       expect(result.user.displayName!.endsWith('🎉')).toBe(true);
+    });
+
+    describe('Milestone 4 — Live PostgreSQL 17 HTTP End-to-End (/api/auth/sync & /api/auth/me)', () => {
+      it('executes full HTTP onboarding, returning sync, concurrent same-email collision, purge block, and status guards against PostgreSQL 17 as studexo_app', async () => {
+        const mockVerifier = new MockTokenVerifier();
+        const env = parseEnv({ NODE_ENV: 'test', LOG_LEVEL: 'silent' });
+        const { app } = createApp({
+          env,
+          checkDatabaseReadiness: async () => ({ configured: true, connected: true }),
+          authDependencies: {
+            tokenVerifier: mockVerifier,
+            authService: createAuthService(appRepo),
+          },
+        });
+
+        const sub = crypto.randomUUID();
+        const email = `e2e_pg_${Date.now()}@studexo.example.com`;
+        const token = mockVerifier.mintToken({ sub, email });
+
+        // 1. Unprovisioned GET /api/auth/me -> 404
+        const beforeMe = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${token}`);
+        expect(beforeMe.status).toBe(404);
+        expect(beforeMe.body.error.code).toBe('AUTH_IDENTITY_NOT_FOUND');
+
+        // 2. First-time POST /api/auth/sync -> 200 (real DB defaults role='student', status='active')
+        const firstSync = await request(app)
+          .post('/api/auth/sync')
+          .set('Authorization', `Bearer ${token}`)
+          .send({
+            displayName: 'PG E2E Student',
+            preferredLocale: 'en',
+            preferredCurrency: 'USD',
+            timezone: 'Asia/Dhaka',
+          });
+        expect(firstSync.status).toBe(200);
+        expect(firstSync.body.user.role).toBe('student');
+        expect(firstSync.body.user.status).toBe('active');
+        expect(firstSync.body.user.supabaseAuthUserId).toBeUndefined();
+
+        // 3. Authenticated GET /api/auth/me -> 200
+        const afterMe = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${token}`);
+        expect(afterMe.status).toBe(200);
+        expect(afterMe.body.user.id).toBe(firstSync.body.user.id);
+
+        // 4. Concurrent HTTP POST /api/auth/sync from two different UUIDs claiming the same email
+        const raceSubA = crypto.randomUUID();
+        const raceSubB = crypto.randomUUID();
+        const sharedEmail = `e2e_race_${Date.now()}_${crypto.randomBytes(4).toString('hex')}@studexo.example.com`;
+        const raceTokenA = mockVerifier.mintToken({ sub: raceSubA, email: sharedEmail });
+        const raceTokenB = mockVerifier.mintToken({ sub: raceSubB, email: sharedEmail });
+
+        const [raceResA, raceResB] = await Promise.all([
+          request(app).post('/api/auth/sync').set('Authorization', `Bearer ${raceTokenA}`),
+          request(app).post('/api/auth/sync').set('Authorization', `Bearer ${raceTokenB}`),
+        ]);
+        expect([raceResA.status, raceResB.status].sort()).toEqual([200, 409]);
+
+        const raceRows = await appSql<{ id: string }[]>`
+          SELECT id FROM studexo.users WHERE primary_email = ${sharedEmail.toLowerCase()}
+        `;
+        expect(raceRows).toHaveLength(1);
+
+        // 5. Outbox purge entry blocks HTTP POST /api/auth/sync with 403 AUTH_PURGE_IN_PROGRESS
+        const purgedSub = crypto.randomUUID();
+        await adminSql`
+          INSERT INTO studexo.external_identity_purge_outbox (
+            id, former_user_id, supabase_auth_user_id, status, attempt_count, max_attempts, next_attempt_at
+          ) VALUES (
+            ${crypto.randomUUID()}::uuid,
+            ${crypto.randomUUID()}::uuid,
+            ${purgedSub}::uuid,
+            'pending_purge',
+            0,
+            10,
+            pg_catalog.now()
+          )
+        `;
+        const purgedToken = mockVerifier.mintToken({
+          sub: purgedSub,
+          email: `purged_e2e_${Date.now()}@studexo.example.com`,
+        });
+        const purgedSync = await request(app)
+          .post('/api/auth/sync')
+          .set('Authorization', `Bearer ${purgedToken}`);
+        expect(purgedSync.status).toBe(403);
+        expect(purgedSync.body.error.code).toBe('AUTH_PURGE_IN_PROGRESS');
+
+        // 6. Account suspension in DB blocks GET /api/auth/me with 403 AUTH_USER_SUSPENDED
+        await adminSql`
+          UPDATE studexo.users SET status = 'suspended' WHERE id = ${firstSync.body.user.id}::uuid
+        `;
+        const suspendedMe = await request(app).get('/api/auth/me').set('Authorization', `Bearer ${token}`);
+        expect(suspendedMe.status).toBe(403);
+        expect(suspendedMe.body.error.code).toBe('AUTH_USER_SUSPENDED');
+      });
     });
   },
 );
