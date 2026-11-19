@@ -778,6 +778,114 @@ describe('Phase 8B.5A Milestone 1 — Cryptographic Token Verifier & Claims Engi
         expect(authErr.statusCode).toBe(403);
       }
     });
+
+    it('distinguishes GoTrue 5xx/network outages (503 AUTH_PROVIDER_UNAVAILABLE) from revoked tokens (401 AUTH_INVALID_TOKEN)', async () => {
+      const outageClient = {
+        auth: {
+          getUser: async () => {
+            throw new TypeError('fetch failed: ECONNREFUSED');
+          },
+        },
+      };
+      const outageVerifier = new SupabaseTokenVerifier({
+        supabaseUrl: 'https://example.supabase.co',
+        supabaseAnonKey: 'anon-key-test',
+        client: outageClient as unknown as import('@supabase/supabase-js').SupabaseClient,
+      });
+
+      await expect(outageVerifier.verifyAuthoritativeUser('dummy-token')).rejects.toMatchObject({
+        code: 'AUTH_PROVIDER_UNAVAILABLE',
+        statusCode: 503,
+      });
+
+      const timeoutClient = {
+        auth: {
+          getUser: () => new Promise(() => {}), // never resolves
+        },
+      };
+      const timeoutVerifier = new SupabaseTokenVerifier({
+        supabaseUrl: 'https://example.supabase.co',
+        supabaseAnonKey: 'anon-key-test',
+        requestTimeoutMs: 25,
+        client: timeoutClient as unknown as import('@supabase/supabase-js').SupabaseClient,
+      });
+
+      await expect(timeoutVerifier.verifyAuthoritativeUser('dummy-token')).rejects.toMatchObject({
+        code: 'AUTH_PROVIDER_UNAVAILABLE',
+        statusCode: 503,
+      });
+
+      const { AuthApiError } = await import('@supabase/supabase-js');
+      const revokedClient = {
+        auth: {
+          getUser: async () => ({
+            data: { user: null },
+            error: new AuthApiError('Session from session_id claim in JWT does not exist', 401, 'session_not_found'),
+          }),
+        },
+      };
+      const revokedVerifier = new SupabaseTokenVerifier({
+        supabaseUrl: 'https://example.supabase.co',
+        supabaseAnonKey: 'anon-key-test',
+        client: revokedClient as unknown as import('@supabase/supabase-js').SupabaseClient,
+      });
+
+      await expect(revokedVerifier.verifyAuthoritativeUser('dummy-token')).rejects.toMatchObject({
+        code: 'AUTH_INVALID_TOKEN',
+        statusCode: 401,
+      });
+    });
+
+    it('enforces key-matched algorithms (blocking HS256/RS256/ES256 confusion), supports JWK ES256 keys, and throws 500 AUTH_CONFIGURATION_ERROR when unconfigured', () => {
+      const unconfigured = new LocalJwtVerifier({});
+      const hsToken = createSignedHs256Token();
+      expect(() => unconfigured.verify(hsToken)).toThrowError(AuthError);
+      try {
+        unconfigured.verify(hsToken);
+      } catch (err) {
+        expect((err as AuthError).code).toBe('AUTH_CONFIGURATION_ERROR');
+        expect((err as AuthError).statusCode).toBe(500);
+      }
+
+      // Generate EC P-256 key pair and verify using JWK string (as returned by Supabase JWKS)
+      const { publicKey: ecPub, privateKey: ecPriv } = crypto.generateKeyPairSync('ec', {
+        namedCurve: 'prime256v1',
+      });
+      const jwkString = JSON.stringify(ecPub.export({ format: 'jwk' }));
+      const jwkEsVerifier = new LocalJwtVerifier({
+        publicKey: jwkString,
+        expectedAudience: 'authenticated',
+      });
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const rawHeader = Buffer.from(JSON.stringify({ alg: 'ES256', typ: 'JWT' })).toString('base64url');
+      const rawPayload = Buffer.from(
+        JSON.stringify({
+          sub: VALID_USER_ID,
+          email: VALID_EMAIL,
+          aud: 'authenticated',
+          role: 'authenticated',
+          iat: nowSec,
+          exp: nowSec + 3600,
+        }),
+      ).toString('base64url');
+      const signer = crypto.createSign('SHA256');
+      signer.update(`${rawHeader}.${rawPayload}`);
+      const sig = signer.sign({ key: ecPriv, dsaEncoding: 'ieee-p1363' }, 'base64url');
+      const esToken = `${rawHeader}.${rawPayload}.${sig}`;
+
+      const claims = jwkEsVerifier.verify(esToken);
+      expect(claims.sub).toBe(VALID_USER_ID);
+
+      // ES256-configured verifier must block HS256 algorithm confusion with 401 AUTH_INVALID_ALGORITHM
+      expect(() => jwkEsVerifier.verify(hsToken)).toThrowError(AuthError);
+      try {
+        jwkEsVerifier.verify(hsToken);
+      } catch (err) {
+        expect((err as AuthError).code).toBe('AUTH_INVALID_ALGORITHM');
+        expect((err as AuthError).statusCode).toBe(401);
+      }
+    });
   });
 
   describe('MockTokenVerifier (Offline Test Harness)', () => {

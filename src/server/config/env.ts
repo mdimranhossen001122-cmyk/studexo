@@ -159,6 +159,7 @@ const supabaseEnvSchema = z.object({
   SUPABASE_ANON_KEY: optionalNonEmptyString,
   SUPABASE_SERVICE_ROLE_KEY: optionalNonEmptyString,
   SUPABASE_JWT_SECRET: optionalNonEmptyString,
+  SUPABASE_JWT_PUBLIC_KEY: optionalNonEmptyString,
   VITE_SUPABASE_URL: optionalUrl,
   VITE_SUPABASE_ANON_KEY: optionalNonEmptyString,
 });

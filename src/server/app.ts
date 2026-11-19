@@ -2,6 +2,11 @@ import express, { type Express, type Router } from 'express';
 import type { Logger } from 'pino';
 import { parseEnv, type AppEnv } from './config/env';
 import { createLogger } from './lib/logger';
+import {
+  createAppAuthMiddleware,
+  type AuthMiddlewareDependencies,
+  type AuthMiddlewarePipeline,
+} from './middleware/auth';
 import { apiNotFoundHandler, createErrorHandler } from './middleware/errorHandler';
 import {
   assignRequestId,
@@ -22,8 +27,10 @@ export interface CreateAppOptions {
   env?: AppEnv;
   logger?: Logger;
   clientRouter?: Router;
+  apiRouter?: Router;
   rateLimitMax?: number;
   checkDatabaseReadiness?: DatabaseReadinessProbe;
+  authDependencies?: AuthMiddlewareDependencies;
 }
 
 export interface AppContext {
@@ -31,12 +38,16 @@ export interface AppContext {
   env: AppEnv;
   logger: Logger;
   clientRouter: Router;
+  apiRouter: Router;
+  authMiddleware: AuthMiddlewarePipeline;
 }
 
 export function createApp(options: CreateAppOptions = {}): AppContext {
   const env = options.env ?? parseEnv(process.env);
   const logger = options.logger ?? createLogger(env.runtime.logLevel);
   const clientRouter = options.clientRouter ?? express.Router();
+  const apiRouter = options.apiRouter ?? express.Router();
+  const authMiddleware = createAppAuthMiddleware(env, options.authDependencies);
   const isProduction = env.runtime.NODE_ENV === 'production';
 
   const app = express();
@@ -54,7 +65,7 @@ export function createApp(options: CreateAppOptions = {}): AppContext {
   app.use(express.json({ limit: '100kb' }));
   app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 
-  // Initial API routes
+  // Initial API routes (rate limited, with public health/readiness probes above protected routes)
   app.use('/api', createApiRateLimiter(env, options.rateLimitMax));
   app.use(
     '/api',
@@ -62,6 +73,7 @@ export function createApp(options: CreateAppOptions = {}): AppContext {
       checkDatabaseReadiness: options.checkDatabaseReadiness,
     }),
   );
+  app.use('/api', apiRouter);
   app.use('/api', apiNotFoundHandler);
 
   // Client SPA / Vite middleware slot (populated by server.ts)
@@ -70,5 +82,5 @@ export function createApp(options: CreateAppOptions = {}): AppContext {
   // Centralized error serialization (always final middleware)
   app.use(createErrorHandler({ logger, isProduction }));
 
-  return { app, env, logger, clientRouter };
+  return { app, env, logger, clientRouter, apiRouter, authMiddleware };
 }

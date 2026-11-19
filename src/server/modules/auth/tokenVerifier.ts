@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 import {
   createClient,
   isAuthApiError,
+  isAuthRetryableFetchError,
   type SupabaseClient,
   type User,
 } from '@supabase/supabase-js';
@@ -99,30 +100,125 @@ function base64UrlDecode(str: string): string {
   }
 }
 
+export function normalizeVerificationPublicKey(
+  rawKey: string | Buffer | crypto.KeyObject,
+): crypto.KeyObject | Buffer {
+  if (rawKey instanceof crypto.KeyObject) {
+    return rawKey;
+  }
+
+  if (Buffer.isBuffer(rawKey)) {
+    return rawKey;
+  }
+
+  const trimmed = rawKey.trim();
+  if (!trimmed) {
+    throw new AuthError('AUTH_CONFIGURATION_ERROR', 'Configured JWT verification public key is empty.');
+  }
+
+  if (trimmed.startsWith('{')) {
+    try {
+      const jwk = JSON.parse(trimmed) as crypto.JsonWebKey;
+      return crypto.createPublicKey({ key: jwk, format: 'jwk' });
+    } catch {
+      throw new AuthError(
+        'AUTH_CONFIGURATION_ERROR',
+        'Configured JWT verification JWK public key is invalid.',
+      );
+    }
+  }
+
+  const normalizedPem = trimmed.includes('\\n') ? trimmed.replace(/\\n/g, '\n') : trimmed;
+  try {
+    return crypto.createPublicKey(normalizedPem);
+  } catch {
+    throw new AuthError(
+      'AUTH_CONFIGURATION_ERROR',
+      'Configured JWT verification PEM public key is invalid.',
+    );
+  }
+}
+
 /**
  * Pure cryptographic JWT verifier using Node 22 built-in `node:crypto`.
  * Enforces algorithm allowlisting, timing-safe signature comparison, expiry, issuer, and audience.
  */
 export class LocalJwtVerifier {
   private readonly jwtSecret?: string;
-  private readonly publicKey?: string | Buffer | crypto.KeyObject;
+  private readonly publicKey?: crypto.KeyObject | Buffer;
+  private readonly publicKeyConfigError?: AuthError;
   private readonly expectedIssuer?: string;
   private readonly expectedAudience: string;
   private readonly clockToleranceSeconds: number;
   private readonly allowedAlgorithms: Set<string>;
 
   constructor(options: LocalJwtVerifierOptions = {}) {
-    this.jwtSecret = options.jwtSecret?.trim();
-    this.publicKey = options.publicKey;
+    this.jwtSecret = options.jwtSecret?.trim() || undefined;
     this.expectedIssuer = options.expectedIssuer?.trim();
     this.expectedAudience = options.expectedAudience ?? 'authenticated';
     this.clockToleranceSeconds = options.clockToleranceSeconds ?? DEFAULT_CLOCK_TOLERANCE_SECONDS;
-    this.allowedAlgorithms = new Set(options.allowedAlgorithms ?? Array.from(ALLOWED_JWT_ALGORITHMS));
+
+    if (options.publicKey !== undefined) {
+      try {
+        this.publicKey = normalizeVerificationPublicKey(options.publicKey);
+      } catch (err) {
+        if (err instanceof AuthError) {
+          this.publicKeyConfigError = err;
+        } else {
+          this.publicKeyConfigError = new AuthError(
+            'AUTH_CONFIGURATION_ERROR',
+            'Configured JWT verification public key is invalid.',
+          );
+        }
+      }
+    }
+
+    if (options.allowedAlgorithms) {
+      this.allowedAlgorithms = new Set(
+        options.allowedAlgorithms.map((a) => a.toUpperCase()).filter((a) => a !== 'NONE'),
+      );
+    } else {
+      const derived = new Set<string>();
+      if (this.jwtSecret) {
+        derived.add('HS256');
+      }
+      if (this.publicKey) {
+        if (this.publicKey instanceof crypto.KeyObject) {
+          if (this.publicKey.asymmetricKeyType === 'ec') {
+            derived.add('ES256');
+          } else if (
+            this.publicKey.asymmetricKeyType === 'rsa' ||
+            this.publicKey.asymmetricKeyType === 'rsa-pss'
+          ) {
+            derived.add('RS256');
+          } else {
+            derived.add('RS256');
+            derived.add('ES256');
+          }
+        } else {
+          derived.add('RS256');
+          derived.add('ES256');
+        }
+      }
+      // If neither secret nor key is configured yet, preserve default set so verify() raises AUTH_CONFIGURATION_ERROR
+      this.allowedAlgorithms = derived.size > 0 ? derived : new Set(ALLOWED_JWT_ALGORITHMS);
+    }
   }
 
   public verify(token: string): AuthTokenClaims {
     if (typeof token !== 'string' || token.trim().length === 0) {
       throw new AuthError('AUTH_TOKEN_MISSING', 'Authentication token is missing or empty.');
+    }
+
+    if (this.publicKeyConfigError) {
+      throw this.publicKeyConfigError;
+    }
+
+    if (!this.jwtSecret && !this.publicKey) {
+      throw new AuthError(
+        'AUTH_CONFIGURATION_ERROR',
+        'Local JWT verification is not configured with a signing secret or public key.',
+      );
     }
 
     const segments = token.trim().split('.');
@@ -160,7 +256,7 @@ export class LocalJwtVerifier {
     if (alg === 'HS256') {
       if (!this.jwtSecret) {
         throw new AuthError(
-          'AUTH_INVALID_TOKEN',
+          'AUTH_CONFIGURATION_ERROR',
           'Local HS256 verification requested, but SUPABASE_JWT_SECRET is not configured.',
         );
       }
@@ -182,7 +278,7 @@ export class LocalJwtVerifier {
     } else if (alg === 'RS256' || alg === 'ES256') {
       if (!this.publicKey) {
         throw new AuthError(
-          'AUTH_INVALID_TOKEN',
+          'AUTH_CONFIGURATION_ERROR',
           `Local ${alg} verification requested, but public key is not configured.`,
         );
       }
@@ -195,10 +291,16 @@ export class LocalJwtVerifier {
         const sigBuffer = Buffer.from(rawSignature, 'base64url');
         if (alg === 'ES256') {
           // RFC 7518 Section 3.4 requires IEEE P1363 (64 bytes) for ECDSA P-256 JWT signatures
-          const verifyKeyInput: crypto.VerifyPublicKeyInput = {
-            key: this.publicKey as string | Buffer,
-            dsaEncoding: sigBuffer.length === 64 ? 'ieee-p1363' : 'der',
-          };
+          const verifyKeyInput: crypto.VerifyKeyObjectInput | crypto.VerifyPublicKeyInput =
+            this.publicKey instanceof crypto.KeyObject
+              ? {
+                  key: this.publicKey,
+                  dsaEncoding: sigBuffer.length === 64 ? 'ieee-p1363' : 'der',
+                }
+              : {
+                  key: this.publicKey,
+                  dsaEncoding: sigBuffer.length === 64 ? 'ieee-p1363' : 'der',
+                };
           isValid = verifier.verify(verifyKeyInput, sigBuffer);
         } else {
           isValid = verifier.verify(this.publicKey, sigBuffer);
@@ -576,26 +678,79 @@ export class SupabaseTokenVerifier implements TokenVerifier {
       throw new AuthError('AUTH_TOKEN_MISSING', 'Authentication token is required for identity verification.');
     }
 
-    let controller: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     try {
-      controller = new AbortController();
-      timer = setTimeout(() => controller?.abort(), this.requestTimeoutMs);
-      timer.unref?.();
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new AuthError(
+              'AUTH_PROVIDER_UNAVAILABLE',
+              'Identity provider verification timed out.',
+              { statusCode: 503 },
+            ),
+          );
+        }, this.requestTimeoutMs);
+        timer.unref?.();
+      });
 
-      const { data, error } = await this.supabaseClient.auth.getUser(token.trim());
+      const { data, error } = await Promise.race([
+        this.supabaseClient.auth.getUser(token.trim()),
+        timeoutPromise,
+      ]);
 
       if (error || !data.user) {
+        if (isAuthRetryableFetchError(error)) {
+          throw new AuthError(
+            'AUTH_PROVIDER_UNAVAILABLE',
+            'Identity provider is temporarily unreachable.',
+            { statusCode: 503 },
+          );
+        }
+
         if (isAuthApiError(error)) {
-          if (error.status === 401 || error.code === 'bad_jwt' || error.code === 'invalid_jwt') {
+          if (error.status >= 500 || error.status === 429 || error.status === 0) {
+            throw new AuthError(
+              'AUTH_PROVIDER_UNAVAILABLE',
+              'Identity provider returned an upstream error.',
+              { statusCode: 503 },
+            );
+          }
+          if (error.code === 'user_banned') {
+            throw new AuthError(
+              'AUTH_USER_BANNED',
+              'Account has been banned by identity provider administrator.',
+              { statusCode: 403 },
+            );
+          }
+          if (
+            error.status === 401 ||
+            error.code === 'bad_jwt' ||
+            error.code === 'invalid_jwt' ||
+            error.code === 'session_not_found' ||
+            error.code === 'user_not_found'
+          ) {
             throw new AuthError('AUTH_INVALID_TOKEN', error.message);
           }
           if (error.status === 403) {
             throw new AuthError('AUTH_INVALID_AUDIENCE', error.message, { statusCode: 403 });
           }
+          throw new AuthError('AUTH_INVALID_TOKEN', error.message);
         }
-        throw new AuthError('AUTH_INVALID_TOKEN', error?.message ?? 'User session is invalid or revoked.');
+
+        if (error) {
+          const rawStatus = (error as { status?: unknown }).status;
+          if (typeof rawStatus !== 'number' || rawStatus === 0 || rawStatus >= 500) {
+            throw new AuthError(
+              'AUTH_PROVIDER_UNAVAILABLE',
+              'Identity provider is temporarily unavailable.',
+              { statusCode: 503 },
+            );
+          }
+          throw new AuthError('AUTH_INVALID_TOKEN', error.message);
+        }
+
+        throw new AuthError('AUTH_INVALID_TOKEN', 'User session is invalid or revoked.');
       }
 
       const user = data.user;
@@ -628,6 +783,15 @@ export class SupabaseTokenVerifier implements TokenVerifier {
         rawAppMetadata: user.app_metadata,
         rawUserMetadata: user.user_metadata,
       };
+    } catch (err) {
+      if (err instanceof AuthError) {
+        throw err;
+      }
+      throw new AuthError(
+        'AUTH_PROVIDER_UNAVAILABLE',
+        'Identity provider verification failed due to a network or upstream outage.',
+        { statusCode: 503 },
+      );
     } finally {
       if (timer) clearTimeout(timer);
     }

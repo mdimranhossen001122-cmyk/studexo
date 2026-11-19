@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from 'express';
 import type { Logger } from 'pino';
 import { ZodError } from 'zod';
 import type { ApiErrorPayload } from '../../shared/types/api';
+import { AuthError } from '../../shared/types/auth';
 import { getSafePath } from './requestLogger';
 
 export class AppError extends Error {
@@ -51,6 +52,37 @@ export function createErrorHandler(options: { logger: Logger; isProduction: bool
   ): void {
     const requestId = res.locals.requestId as string | undefined;
     const safePath = getSafePath(req);
+
+    if (err instanceof AuthError) {
+      if (err.statusCode === 401) {
+        res.setHeader('WWW-Authenticate', 'Bearer');
+      }
+
+      if (err.statusCode >= 500) {
+        logger.error({ err, requestId, path: safePath, code: err.code }, err.message);
+      } else {
+        logger.warn(
+          { code: err.code, statusCode: err.statusCode, requestId, path: safePath },
+          err.message,
+        );
+      }
+
+      const payload: ApiErrorPayload = {
+        error: {
+          code: err.code,
+          message:
+            isProduction && err.statusCode >= 500
+              ? err.statusCode === 503
+                ? 'Authentication service is temporarily unavailable'
+                : 'Internal server error'
+              : err.message,
+          ...(requestId ? { requestId } : {}),
+          ...(!isProduction && err.details !== undefined ? { details: err.details } : {}),
+        },
+      };
+      res.status(err.statusCode).json(payload);
+      return;
+    }
 
     if (err instanceof AppError) {
       if (err.statusCode >= 500) {

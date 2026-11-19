@@ -14,15 +14,19 @@ export type AuthErrorCode =
   | 'AUTH_INVALID_AUDIENCE'
   | 'AUTH_INVALID_ISSUER'
   | 'AUTH_EMAIL_REQUIRED'
+  | 'AUTH_UNAUTHENTICATED'
+  | 'AUTH_FORBIDDEN'
   | 'AUTH_EMAIL_NOT_VERIFIED'
   | 'AUTH_USER_BANNED'
   | 'AUTH_IDENTITY_NOT_FOUND'
   | 'AUTH_PROVIDER_ERROR'
+  | 'AUTH_PROVIDER_UNAVAILABLE'
   | 'AUTH_PURGE_IN_PROGRESS'
   | 'AUTH_IDENTITY_COLLISION'
   | 'AUTH_USER_SUSPENDED'
   | 'AUTH_USER_PENDING_DELETION'
-  | 'AUTH_PROVISIONING_FAILED';
+  | 'AUTH_PROVISIONING_FAILED'
+  | 'AUTH_CONFIGURATION_ERROR';
 
 export class AuthError extends Error {
   public readonly code: AuthErrorCode;
@@ -39,8 +43,10 @@ export class AuthError extends Error {
     this.code = code;
     this.statusCode =
       options?.statusCode ??
-      (code === 'AUTH_EMAIL_NOT_VERIFIED' ||
+      (code === 'AUTH_FORBIDDEN' ||
+      code === 'AUTH_EMAIL_NOT_VERIFIED' ||
       code === 'AUTH_USER_BANNED' ||
+      code === 'AUTH_PROVIDER_ERROR' ||
       code === 'AUTH_PURGE_IN_PROGRESS' ||
       code === 'AUTH_USER_SUSPENDED' ||
       code === 'AUTH_USER_PENDING_DELETION'
@@ -49,9 +55,11 @@ export class AuthError extends Error {
           ? 409
           : code === 'AUTH_IDENTITY_NOT_FOUND'
             ? 404
-            : code === 'AUTH_PROVISIONING_FAILED'
-              ? 500
-              : 401);
+            : code === 'AUTH_PROVIDER_UNAVAILABLE'
+              ? 503
+              : code === 'AUTH_PROVISIONING_FAILED' || code === 'AUTH_CONFIGURATION_ERROR'
+                ? 500
+                : 401);
     this.details = options?.details;
   }
 }
