@@ -59,16 +59,36 @@ export interface FileDeletionRequestRepository {
   requestFileDeletion(fileId: string, actorUserId: string): Promise<StoredFileLifecycleRecord | null>;
 }
 
+export type FilePurgeLeaseResult =
+  | {
+      status: 'acquired';
+      file: StoredFileLifecycleRecord;
+    }
+  | {
+      status: 'blocked_by_references';
+      blockingReferences: number;
+      file: StoredFileLifecycleRecord;
+    }
+  | {
+      status: 'unavailable';
+      reason: 'not_found' | 'not_eligible' | 'active_lease';
+      file: StoredFileLifecycleRecord | null;
+    };
+
 /**
  * Stage 2 (Background worker role `studexo_purge_worker`) repository contract for Storage-first
- * file purging, pre-lease reference re-verification/rollback, and purge leasing.
+ * file purging, atomic pre-lease reference re-verification/rollback, and purge leasing.
  *
  * Concrete PostgreSQL implementations MUST uphold the locking protocol paired with
  * `studexo.guard_document_versions_integrity()` and `studexo.revert_stored_file_deletion_request(uuid, uuid)`:
  * - `guard_document_versions_integrity()` locks the target `studexo.stored_files` row `FOR SHARE`.
- * - `markFilePendingPurge()` and `acquireFilePurgeLease()` lock the target `studexo.stored_files` row
- *   `FOR UPDATE` inside a database transaction before calling `countBlockingReferences()` so
- *   concurrent `document_versions` insertions serialize cleanly.
+ * - `acquireFilePurgeLeaseIfUnreferenced()` locks `studexo.stored_files` `FOR UPDATE` inside a
+ *   `READ COMMITTED` transaction, counts `studexo.document_versions` references inside that same
+ *   transaction, computes `purge_lease_until` using PostgreSQL `pg_catalog.now()`, and only
+ *   transitions to `purging` when zero blocking references exist.
+ * - `acquireFilePurgeLease()` locks `studexo.stored_files` `FOR UPDATE` inside a `READ COMMITTED`
+ *   transaction and computes `purge_lease_until` using PostgreSQL `pg_catalog.now()` without
+ *   failing on departing-user `document_versions` rows during account purge.
  * - `revertPendingPurgeToNone()` invokes `studexo.revert_stored_file_deletion_request(fileId, ownerUserId)`
  *   only when untouched `pending_purge` files (`purge_attempts = 0`, `purge_lease_until IS NULL`)
  *   fail pre-lease reference checks, atomically resetting `purge_state = 'none'`,
@@ -80,17 +100,23 @@ export interface FilePurgeWorkerRepository {
   markFilePendingPurge(
     fileId: string,
     ownerUserId: string,
-    requestedAt: Date,
+    requestedAt?: Date,
   ): Promise<StoredFileLifecycleRecord | null>;
-  countBlockingReferences(fileId: string, ownerUserId: string): Promise<number>;
+  acquireFilePurgeLeaseIfUnreferenced(
+    fileId: string,
+    ownerUserId: string,
+    leaseSeconds: number,
+  ): Promise<FilePurgeLeaseResult>;
   acquireFilePurgeLease(
     fileId: string,
     ownerUserId: string,
-    leaseUntil: Date,
+    leaseSeconds: number,
   ): Promise<StoredFileLifecycleRecord | null>;
-  markFilePurged(fileId: string, ownerUserId: string, completedAt: Date): Promise<void>;
+  markFilePurged(fileId: string, ownerUserId: string, completedAt?: Date): Promise<void>;
   markFilePurgeFailed(fileId: string, ownerUserId: string, errorMessage: string): Promise<void>;
   revertPendingPurgeToNone(fileId: string, ownerUserId: string): Promise<void>;
+  listDueFilesForPurge(limit?: number): Promise<StoredFileLifecycleRecord[]>;
+  listExpiredPurgeLeases(limit?: number): Promise<StoredFileLifecycleRecord[]>;
 }
 
 export interface FilePurgeLeaseRecoveryRepository {
@@ -102,22 +128,38 @@ export interface FilePurgeLeaseRecoveryRepository {
   }): Promise<StoredFileLifecycleRecord | null>;
 }
 
+export interface AccountPurgeFailureFencing {
+  expectedLeaseOwner: string;
+  expectedPurgeAttempts: number;
+}
+
+export type AccountPurgeFailureWriteResult =
+  | { status: 'recorded'; user: UserLifecycleRecord }
+  | { status: 'stale_lease'; user: UserLifecycleRecord | null };
+
 export interface AccountPurgeRepository {
   getUserForPurge(userId: string): Promise<UserLifecycleRecord | null>;
   markUserPurging(params: {
     userId: string;
     leaseOwner: string;
-    leaseUntil: Date;
+    leaseSeconds: number;
+    leaseUntil?: Date;
   }): Promise<UserLifecycleRecord | null>;
-  markUserPurgeFailed(userId: string, errorMessage: string): Promise<void>;
+  markUserPurgeFailed(
+    userId: string,
+    errorMessage: string,
+    fencing: AccountPurgeFailureFencing,
+  ): Promise<AccountPurgeFailureWriteResult | void>;
   listUserStoredFiles(userId: string): Promise<StoredFileLifecycleRecord[]>;
-  executeAccountPurgeRpc(userId: string): Promise<void>;
+  executeAccountPurgeRpc(userId: string, fencing: AccountPurgeFailureFencing): Promise<void>;
+  listDueUsersForPurge(limit?: number): Promise<UserLifecycleRecord[]>;
+  listExpiredAccountPurges(limit?: number): Promise<UserLifecycleRecord[]>;
 }
 
 export interface AccountPurgeLeaseRecoveryRepository {
   markExpiredAccountPurgeLeaseFailed(params: {
     userId: string;
-    failedAt: Date;
+    failedAt?: Date;
     errorMessage: string;
   }): Promise<UserLifecycleRecord | null>;
   findExternalIdentityOutboxByAuthUserId(
@@ -132,6 +174,81 @@ export interface ExternalIdentityOutboxItem {
   status: Extract<PurgeState, 'pending_purge' | 'purging' | 'purge_failed' | 'purged'>;
   attemptCount: number;
   maxAttempts: number;
+}
+
+export interface ExternalIdentityOutboxRecord extends ExternalIdentityOutboxItem {
+  nextAttemptAt: Date;
+  leaseOwner: string | null;
+  lockedUntil: Date | null;
+  lastErrorCode: string | null;
+  lastErrorMessage: string | null;
+  completedAt: Date | null;
+}
+
+export interface ExternalIdentityOutboxFencing {
+  expectedLeaseOwner: string;
+  expectedAttemptCount: number;
+}
+
+export type ExternalIdentityOutboxClaimResult =
+  | {
+      status: 'acquired';
+      mode: 'normal' | 'reconciliation';
+      item: ExternalIdentityOutboxRecord;
+    }
+  | {
+      status: 'unavailable';
+      reason:
+        | 'not_found'
+        | 'already_purged'
+        | 'active_lease'
+        | 'retry_not_due'
+        | 'max_attempts_exhausted';
+      item: ExternalIdentityOutboxRecord | null;
+    };
+
+export type ExternalIdentityOutboxWriteResult =
+  | { status: 'updated'; item: ExternalIdentityOutboxRecord }
+  | { status: 'stale_lease'; item: ExternalIdentityOutboxRecord | null };
+
+export interface ExternalIdentityOutboxRepository {
+  getOutboxItemById(outboxId: string): Promise<ExternalIdentityOutboxRecord | null>;
+  acquireOutboxLease(params: {
+    outboxId: string;
+    leaseOwner: string;
+    leaseSeconds: number;
+    allowExhaustedReconciliation?: boolean;
+  }): Promise<ExternalIdentityOutboxClaimResult>;
+  claimDueOutboxItems(params: {
+    leaseOwner: string;
+    leaseSeconds: number;
+    limit?: number;
+  }): Promise<ExternalIdentityOutboxRecord[]>;
+  listDueExhaustedOutboxItems(params?: {
+    limit?: number;
+  }): Promise<ExternalIdentityOutboxRecord[]>;
+  markOutboxPurged(params: {
+    outboxId: string;
+    fencing: ExternalIdentityOutboxFencing;
+  }): Promise<ExternalIdentityOutboxWriteResult>;
+  markOutboxPurgeFailed(params: {
+    outboxId: string;
+    retryDelaySeconds: number;
+    errorCode?: string | null;
+    errorMessage: string;
+    fencing: ExternalIdentityOutboxFencing;
+  }): Promise<ExternalIdentityOutboxWriteResult>;
+}
+
+export interface ExternalIdentityOutboxRecoveryRepository {
+  markExpiredOutboxLeaseFailed(params: {
+    outboxId: string;
+    expectedLeaseOwner: string | null;
+    expectedAttemptCount: number;
+    retryDelaySeconds: number;
+    errorCode?: string | null;
+    errorMessage: string;
+  }): Promise<ExternalIdentityOutboxWriteResult>;
 }
 
 export interface SupabaseAuthAdminAdapter {
@@ -534,6 +651,9 @@ export async function processPendingStoredFileDeletion(params: {
 }): Promise<ProcessPendingFileDeletionResult> {
   const now = params.now ?? new Date();
   const leaseSeconds = params.leaseSeconds ?? 60;
+  if (!Number.isFinite(leaseSeconds) || leaseSeconds <= 0) {
+    throw new Error('leaseSeconds must be a finite positive number.');
+  }
 
   const file = await params.repo.getFileForPurge(params.fileId, params.ownerUserId);
   if (!file) {
@@ -549,35 +669,51 @@ export async function processPendingStoredFileDeletion(params: {
     throw new Error(`Active purge lease held for stored_file ${file.id}.`);
   }
 
-  if (file.purgeState === 'pending_purge') {
-    const blockingRefs = await params.repo.countBlockingReferences(
-      file.id,
-      params.ownerUserId,
-    );
-    if (blockingRefs > 0) {
-      if (file.purgeAttempts === 0 && !file.purgeLeaseUntil && !file.lastPurgeError) {
-        await params.repo.revertPendingPurgeToNone(file.id, params.ownerUserId);
-        return {
-          fileId: file.id,
-          outcome: 'reverted_blocked_by_refs',
-          blockingReferences: blockingRefs,
-        };
-      }
-      throw new Error(
-        `Cannot purge stored_file ${file.id}: ${blockingRefs} active document or evidence reference(s) remain.`,
-      );
-    }
-  }
-
-  const leaseUntil = new Date(now.getTime() + leaseSeconds * 1000);
-  const leased = await params.repo.acquireFilePurgeLease(
+  const leaseResult = await params.repo.acquireFilePurgeLeaseIfUnreferenced(
     file.id,
     params.ownerUserId,
-    leaseUntil,
+    leaseSeconds,
   );
-  if (!leased) {
+
+  if (leaseResult.status === 'blocked_by_references') {
+    const blockedFile = leaseResult.file;
+    if (
+      blockedFile.purgeState === 'pending_purge' &&
+      blockedFile.purgeAttempts === 0 &&
+      !blockedFile.purgeLeaseUntil &&
+      !blockedFile.lastPurgeError
+    ) {
+      await params.repo.revertPendingPurgeToNone(blockedFile.id, params.ownerUserId);
+      return {
+        fileId: blockedFile.id,
+        outcome: 'reverted_blocked_by_refs',
+        blockingReferences: leaseResult.blockingReferences,
+      };
+    }
+    throw new Error(
+      `Cannot purge stored_file ${blockedFile.id}: ${leaseResult.blockingReferences} active document or evidence reference(s) remain.`,
+    );
+  }
+
+  if (leaseResult.status === 'unavailable') {
+    const unavailableFile = leaseResult.file;
+    if (
+      unavailableFile &&
+      unavailableFile.purgeState === 'purged' &&
+      unavailableFile.uploadStatus === 'deleted'
+    ) {
+      return { fileId: unavailableFile.id, outcome: 'already_purged' };
+    }
+    if (unavailableFile && unavailableFile.purgeState === 'none') {
+      return { fileId: unavailableFile.id, outcome: 'skipped_not_pending' };
+    }
+    if (leaseResult.reason === 'active_lease') {
+      throw new Error(`Active purge lease held for stored_file ${file.id}.`);
+    }
     throw new Error(`Purge lease busy for stored_file ${file.id}.`);
   }
+
+  const leased = leaseResult.file;
 
   try {
     await params.storage.removeObject(leased.storageBucket, leased.objectKey);
@@ -626,6 +762,9 @@ export async function executeStorageFirstAccountPurge(params: {
 }): Promise<AccountPurgeExecutionResult> {
   const now = params.now ?? new Date();
   const leaseSeconds = params.leaseSeconds ?? 60;
+  if (!Number.isFinite(leaseSeconds) || leaseSeconds <= 0) {
+    throw new Error('leaseSeconds must be a finite positive number.');
+  }
   const leaseOwner = params.leaseOwner ?? 'purge-worker';
   const user = await params.accountRepo.getUserForPurge(params.userId);
   if (!user) {
@@ -645,11 +784,18 @@ export async function executeStorageFirstAccountPurge(params: {
   const claimedUser = await params.accountRepo.markUserPurging({
     userId: user.id,
     leaseOwner,
+    leaseSeconds,
     leaseUntil: accountLeaseUntil,
   });
   if (!claimedUser) {
     throw new Error(`Unable to claim account purge lease for user ${user.id}.`);
   }
+
+  const acquiredLeaseOwner = claimedUser.purgeLeaseOwner ?? leaseOwner;
+  const acquiredPurgeAttempts =
+    claimedUser.purgeAttempts > user.purgeAttempts
+      ? claimedUser.purgeAttempts
+      : user.purgeAttempts + 1;
 
   try {
     const files = await params.accountRepo.listUserStoredFiles(user.id);
@@ -662,15 +808,20 @@ export async function executeStorageFirstAccountPurge(params: {
         continue;
       }
 
-      const markedPending = await params.fileRepo.markFilePendingPurge(file.id, user.id, now);
-      if (!markedPending) {
-        throw new Error(
-          `Unable to mark stored_file ${file.id} pending_purge during account purge.`,
+      if (file.purgeState === 'none') {
+        const markedPending = await params.fileRepo.markFilePendingPurge(
+          file.id,
+          user.id,
+          params.now,
         );
+        if (!markedPending) {
+          throw new Error(
+            `Unable to mark stored_file ${file.id} pending_purge during account purge.`,
+          );
+        }
       }
 
-      const leaseUntil = new Date(now.getTime() + leaseSeconds * 1000);
-      const leased = await params.fileRepo.acquireFilePurgeLease(file.id, user.id, leaseUntil);
+      const leased = await params.fileRepo.acquireFilePurgeLease(file.id, user.id, leaseSeconds);
       if (!leased) {
         throw new Error(`Purge lease busy or unavailable for stored_file ${file.id}.`);
       }
@@ -686,7 +837,7 @@ export async function executeStorageFirstAccountPurge(params: {
             `Storage object ${leased.storageBucket}/${leased.objectKey} remained present during account purge.`,
           );
         }
-        await params.fileRepo.markFilePurged(leased.id, user.id, now);
+        await params.fileRepo.markFilePurged(leased.id, user.id, params.now);
         purgedFileIds.push(leased.id);
       } catch (fileError) {
         const fileMessage =
@@ -705,7 +856,10 @@ export async function executeStorageFirstAccountPurge(params: {
       );
     }
 
-    await params.accountRepo.executeAccountPurgeRpc(user.id);
+    await params.accountRepo.executeAccountPurgeRpc(user.id, {
+      expectedLeaseOwner: acquiredLeaseOwner,
+      expectedPurgeAttempts: acquiredPurgeAttempts,
+    });
 
     return {
       userId: user.id,
@@ -715,7 +869,14 @@ export async function executeStorageFirstAccountPurge(params: {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Account purge failed';
-    await params.accountRepo.markUserPurgeFailed(user.id, message);
+    try {
+      await params.accountRepo.markUserPurgeFailed(user.id, message, {
+        expectedLeaseOwner: acquiredLeaseOwner,
+        expectedPurgeAttempts: acquiredPurgeAttempts,
+      });
+    } catch {
+      // Preserve the original Storage/application error even if failure persistence encounters an error.
+    }
     throw error;
   }
 }
@@ -738,4 +899,327 @@ export async function processExternalIdentityPurgeOutboxItem(
     const message = error instanceof Error ? error.message : 'External auth deletion failed';
     return { status: 'purge_failed', errorMessage: message };
   }
+}
+
+export function isExternalIdentityOutboxLeaseExpired(
+  item: Pick<ExternalIdentityOutboxRecord, 'status' | 'lockedUntil'>,
+  now: Date,
+): boolean {
+  if (item.status !== 'purging') {
+    return false;
+  }
+  if (!item.lockedUntil) {
+    return true;
+  }
+  return item.lockedUntil.getTime() <= now.getTime();
+}
+
+export type ExecuteExternalIdentityOutboxPurgeResult =
+  | {
+      outboxId: string;
+      outcome: 'purged';
+      mode: 'normal' | 'reconciliation';
+      providerStatus: 'deleted' | 'already_absent';
+      item: ExternalIdentityOutboxRecord;
+    }
+  | {
+      outboxId: string;
+      outcome: 'already_purged';
+      item: ExternalIdentityOutboxRecord;
+    }
+  | {
+      outboxId: string;
+      outcome: 'unavailable';
+      reason:
+        | 'not_found'
+        | 'active_lease'
+        | 'retry_not_due'
+        | 'max_attempts_exhausted';
+      item: ExternalIdentityOutboxRecord | null;
+    }
+  | {
+      outboxId: string;
+      outcome: 'stale_lease';
+      mode: 'normal' | 'reconciliation';
+      providerStatus: 'deleted' | 'already_absent';
+      item: ExternalIdentityOutboxRecord | null;
+    };
+
+/**
+ * Durable external identity outbox orchestrator (`studexo_purge_worker` role):
+ * 1. Acquires a fenced outbox lease (`mode: 'normal'` when `attempt_count < max_attempts`, or
+ *    `mode: 'reconciliation'` when `allowExhaustedReconciliation: true` on a due `purge_failed`
+ *    row at `attempt_count = max_attempts`).
+ * 2. Invokes `SupabaseAuthAdminAdapter.deleteUserById(supabaseAuthUserId)`, treating both
+ *    `'deleted'` and `'already_absent'` as confirmed external identity deletion.
+ * 3. Persists completion (`markOutboxPurged`) or failure with retry backoff (`markOutboxPurgeFailed`)
+ *    fenced by both `expectedLeaseOwner` (unique per-claim token) and `expectedAttemptCount`.
+ */
+export async function executeExternalIdentityOutboxPurge(params: {
+  outboxId: string;
+  leaseOwner?: string;
+  leaseSeconds?: number;
+  retryDelaySeconds?: number;
+  allowExhaustedReconciliation?: boolean;
+  repo: ExternalIdentityOutboxRepository;
+  authAdmin: SupabaseAuthAdminAdapter;
+}): Promise<ExecuteExternalIdentityOutboxPurgeResult> {
+  const outboxId = params.outboxId?.trim();
+  if (!outboxId) {
+    throw new Error('outboxId must be a non-empty string.');
+  }
+  const leaseOwner = (params.leaseOwner ?? 'outbox-purge-worker').trim();
+  if (!leaseOwner) {
+    throw new Error('leaseOwner must be a non-empty string.');
+  }
+  const leaseSeconds = params.leaseSeconds ?? 60;
+  if (!Number.isFinite(leaseSeconds) || leaseSeconds <= 0) {
+    throw new Error('leaseSeconds must be a finite positive number.');
+  }
+  const retryDelaySeconds = params.retryDelaySeconds ?? 60;
+  if (!Number.isFinite(retryDelaySeconds) || retryDelaySeconds <= 0) {
+    throw new Error('retryDelaySeconds must be a finite positive number.');
+  }
+
+  const claim = await params.repo.acquireOutboxLease({
+    outboxId,
+    leaseOwner,
+    leaseSeconds,
+    allowExhaustedReconciliation: params.allowExhaustedReconciliation,
+  });
+
+  if (claim.status === 'unavailable') {
+    if (claim.reason === 'already_purged' && claim.item) {
+      return {
+        outboxId: claim.item.id,
+        outcome: 'already_purged',
+        item: claim.item,
+      };
+    }
+    return {
+      outboxId,
+      outcome: 'unavailable',
+      reason: claim.reason === 'already_purged' ? 'not_found' : claim.reason,
+      item: claim.item,
+    };
+  }
+
+  const claimed = claim.item;
+  const acquiredLeaseOwner = claimed.leaseOwner?.trim();
+  if (!acquiredLeaseOwner) {
+    throw new Error(
+      `Acquired outbox lease for ${claimed.id} is missing a valid leaseOwner token.`,
+    );
+  }
+
+  const fencing: ExternalIdentityOutboxFencing = {
+    expectedLeaseOwner: acquiredLeaseOwner,
+    expectedAttemptCount: claimed.attemptCount,
+  };
+
+  let providerResult: { status: 'deleted' | 'already_absent' };
+  try {
+    providerResult = await params.authAdmin.deleteUserById(claimed.supabaseAuthUserId);
+    if (
+      !providerResult ||
+      (providerResult.status !== 'deleted' && providerResult.status !== 'already_absent')
+    ) {
+      throw new Error(
+        `Invalid SupabaseAuthAdminAdapter response for ${claimed.supabaseAuthUserId}.`,
+      );
+    }
+  } catch (providerError) {
+    const errorMessage =
+      providerError instanceof Error && providerError.message.trim().length > 0
+        ? providerError.message
+        : 'External identity provider deletion failed';
+    const rawCode =
+      providerError &&
+      typeof providerError === 'object' &&
+      'code' in providerError &&
+      typeof (providerError as { code?: unknown }).code === 'string'
+        ? (providerError as { code: string }).code
+        : 'PROVIDER_DELETE_FAILED';
+
+    try {
+      await params.repo.markOutboxPurgeFailed({
+        outboxId: claimed.id,
+        retryDelaySeconds,
+        errorCode: rawCode,
+        errorMessage,
+        fencing,
+      });
+    } catch {
+      // Preserve the original provider error even if failure persistence encounters an error.
+    }
+    throw providerError;
+  }
+
+  const completionWrite = await params.repo.markOutboxPurged({
+    outboxId: claimed.id,
+    fencing,
+  });
+
+  if (completionWrite.status === 'stale_lease') {
+    return {
+      outboxId: claimed.id,
+      outcome: 'stale_lease',
+      mode: claim.mode,
+      providerStatus: providerResult.status,
+      item: completionWrite.item,
+    };
+  }
+
+  return {
+    outboxId: claimed.id,
+    outcome: 'purged',
+    mode: claim.mode,
+    providerStatus: providerResult.status,
+    item: completionWrite.item,
+  };
+}
+
+export interface RecoverExpiredExternalIdentityOutboxLeaseResult {
+  outboxId: string;
+  outcome:
+    | 'recovered_to_purge_failed'
+    | 'skipped_not_found'
+    | 'skipped_terminal'
+    | 'skipped_not_purging'
+    | 'active_lease'
+    | 'stale_lease';
+  item: ExternalIdentityOutboxRecord | null;
+}
+
+/**
+ * Recovers an expired `external_identity_purge_outbox.status = 'purging'` lease back to
+ * `purge_failed` without stealing active leases, without modifying `purged` rows, and
+ * without incrementing `attempt_count` (preserving remaining attempts and safely supporting
+ * exhausted-attempt reconciliation at `attempt_count = max_attempts`).
+ */
+export async function recoverExpiredExternalIdentityOutboxLease(params: {
+  outboxId: string;
+  now?: Date;
+  retryDelaySeconds?: number;
+  errorCode?: string | null;
+  repo: Pick<ExternalIdentityOutboxRepository, 'getOutboxItemById'> &
+    ExternalIdentityOutboxRecoveryRepository;
+}): Promise<RecoverExpiredExternalIdentityOutboxLeaseResult> {
+  const outboxId = params.outboxId?.trim();
+  if (!outboxId) {
+    throw new Error('outboxId must be a non-empty string.');
+  }
+  const retryDelaySeconds = params.retryDelaySeconds ?? 60;
+  if (!Number.isFinite(retryDelaySeconds) || retryDelaySeconds <= 0) {
+    throw new Error('retryDelaySeconds must be a finite positive number.');
+  }
+
+  const item = await params.repo.getOutboxItemById(outboxId);
+  if (!item) {
+    return {
+      outboxId,
+      outcome: 'skipped_not_found',
+      item: null,
+    };
+  }
+
+  if (item.status === 'purged') {
+    return {
+      outboxId: item.id,
+      outcome: 'skipped_terminal',
+      item,
+    };
+  }
+
+  if (item.status !== 'purging') {
+    return {
+      outboxId: item.id,
+      outcome: 'skipped_not_purging',
+      item,
+    };
+  }
+
+  if (params.now && !isExternalIdentityOutboxLeaseExpired(item, params.now)) {
+    return {
+      outboxId: item.id,
+      outcome: 'active_lease',
+      item,
+    };
+  }
+
+  const inspectedLeaseOwner =
+    item.leaseOwner && item.leaseOwner.trim().length > 0
+      ? item.leaseOwner.trim()
+      : null;
+  const leaseExpiryIso = item.lockedUntil ? item.lockedUntil.toISOString() : 'unset';
+  const priorOwnerLabel = inspectedLeaseOwner ?? 'none';
+  const defaultErrorCode =
+    item.attemptCount >= item.maxAttempts
+      ? 'LEASE_EXPIRED_RECONCILE_REQUIRED'
+      : 'LEASE_EXPIRED';
+  const errorCode =
+    params.errorCode !== undefined ? params.errorCode : defaultErrorCode;
+  const errorMessage =
+    `Outbox purge lease (owner=${priorOwnerLabel}, attempt=${item.attemptCount}/${item.maxAttempts}) ` +
+    `expired at ${leaseExpiryIso}; recovered to purge_failed`;
+
+  const recoveryWrite = await params.repo.markExpiredOutboxLeaseFailed({
+    outboxId: item.id,
+    expectedLeaseOwner: inspectedLeaseOwner,
+    expectedAttemptCount: item.attemptCount,
+    retryDelaySeconds,
+    errorCode,
+    errorMessage,
+  });
+
+  if (recoveryWrite.status === 'stale_lease') {
+    const latest =
+      recoveryWrite.item ?? (await params.repo.getOutboxItemById(item.id));
+    if (!latest) {
+      return {
+        outboxId: item.id,
+        outcome: 'skipped_not_found',
+        item: null,
+      };
+    }
+    if (latest.status === 'purged') {
+      return {
+        outboxId: item.id,
+        outcome: 'skipped_terminal',
+        item: latest,
+      };
+    }
+    const latestLeaseOwner =
+      latest.leaseOwner && latest.leaseOwner.trim().length > 0
+        ? latest.leaseOwner.trim()
+        : null;
+    if (
+      latestLeaseOwner !== inspectedLeaseOwner ||
+      latest.attemptCount !== item.attemptCount
+    ) {
+      return {
+        outboxId: item.id,
+        outcome: 'stale_lease',
+        item: latest,
+      };
+    }
+    if (latest.status === 'purging') {
+      return {
+        outboxId: item.id,
+        outcome: 'active_lease',
+        item: latest,
+      };
+    }
+    return {
+      outboxId: item.id,
+      outcome: 'skipped_not_purging',
+      item: latest,
+    };
+  }
+
+  return {
+    outboxId: recoveryWrite.item.id,
+    outcome: 'recovered_to_purge_failed',
+    item: recoveryWrite.item,
+  };
 }

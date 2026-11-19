@@ -343,6 +343,7 @@ GRANT SELECT (
   purge_lease_owner,
   purge_lease_until,
   purge_attempts,
+  last_purge_error,
   purged_at
 ) ON studexo.users TO studexo_purge_worker;
 GRANT UPDATE (

@@ -1,0 +1,63 @@
+name: CI & PostgreSQL 17 Lifecycle Integration
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: studexo_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d studexo_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22.22.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Run Typecheck
+        run: npm run typecheck
+
+      - name: Run Linter
+        run: npm run lint
+
+      - name: Run Build
+        run: npm run build
+
+      - name: Run Offline Unit Tests
+        run: npx vitest run --exclude 'tests/postgres*.test.ts' --exclude 'tests/db.test.ts'
+
+      - name: Run PostgreSQL 17 Lifecycle Integration Tests
+        env:
+          TEST_POSTGRES_URL: postgres://postgres:test@localhost:5432/studexo_test
+        run: npx vitest run tests/postgres*.test.ts tests/db.test.ts --fileParallelism=false

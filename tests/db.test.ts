@@ -363,6 +363,8 @@ describe('Studexo database implementation (Phase 8B.3B)', () => {
       '0001_studexo_integrity_triggers_and_extensions',
       '0002_studexo_user_insert_and_file_rollback_guards',
       '0003_studexo_schema_lockout_and_outbox_guard',
+      '0004_fenced_account_purge',
+      '0005_fenced_account_purge_equality',
     ]);
 
     const sql0000 = fs.readFileSync(migration0000Path, 'utf8');
@@ -739,6 +741,9 @@ describe('Studexo database implementation (Phase 8B.3B)', () => {
     );
     expect(step7Section).toContain('purge_lease_owner');
     expect(step7Section).toContain('purge_lease_until');
+    expect(step7Section).toMatch(
+      /GRANT SELECT\s*\([^)]*last_purge_error[^)]*\)\s*ON studexo\.users TO studexo_purge_worker/s,
+    );
     expect(step7Section).toContain('ON studexo.document_versions TO studexo_purge_worker');
 
     // Append-only policy, PostgREST exclusion & Phase 8B.3B docs alignment

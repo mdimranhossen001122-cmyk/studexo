@@ -505,9 +505,12 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
         callOrder.push('worker:markPending');
         return { ...file, purgeState: 'pending_purge' };
       },
-      countBlockingReferences: async () => {
-        callOrder.push('worker:checkRefs');
-        return 0;
+      acquireFilePurgeLeaseIfUnreferenced: async (_fileId, _ownerUserId, leaseSeconds) => {
+        callOrder.push(`worker:acquireLeaseIfUnreferenced(${leaseSeconds})`);
+        return {
+          status: 'acquired',
+          file: { ...file, purgeState: 'purging' },
+        };
       },
       acquireFilePurgeLease: async () => {
         callOrder.push('worker:acquireLease');
@@ -522,6 +525,8 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
       revertPendingPurgeToNone: async () => {
         callOrder.push('worker:revertPending');
       },
+      listDueFilesForPurge: async () => [],
+      listExpiredPurgeLeases: async () => [],
     };
 
     const storage: StorageObjectAdapter = {
@@ -572,7 +577,7 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
       httpStatus: 200,
     });
 
-    // Stage 2: Worker executes ref verification -> lease -> Storage delete -> verify absent -> mark purged
+    // Stage 2: Worker executes atomic reference-checked lease -> Storage delete -> verify absent -> mark purged
     callOrder.length = 0;
     const markPurgedArgs: unknown[][] = [];
     const workerResult = await processPendingStoredFileDeletion({
@@ -591,8 +596,7 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
 
     expect(workerResult).toEqual({ fileId: 'file-1', outcome: 'purged' });
     expect(callOrder).toEqual([
-      'worker:checkRefs',
-      'worker:acquireLease',
+      'worker:acquireLeaseIfUnreferenced(60)',
       'worker:storageRemove',
       'worker:storageVerifyAbsent',
       'worker:markDbPurged',
@@ -607,7 +611,11 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
       ownerUserId: 'user-1',
       repo: {
         ...workerRepo,
-        countBlockingReferences: async () => 2,
+        acquireFilePurgeLeaseIfUnreferenced: async () => ({
+          status: 'blocked_by_references',
+          blockingReferences: 2,
+          file: { ...file, purgeState: 'pending_purge', deletedByUserId: 'user-1' },
+        }),
         revertPendingPurgeToNone: revertSpy,
       },
       storage: { removeObject: removeSpy, verifyObjectAbsent: async () => true },
@@ -670,20 +678,28 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
         ...expiredUser,
         purgeState: 'purging',
         purgeLeaseOwner: leaseOwner,
-        purgeLeaseUntil: leaseUntil,
+        purgeLeaseUntil: leaseUntil ?? null,
+        purgeAttempts: expiredUser.purgeAttempts + 1,
       }),
       markUserPurgeFailed: userFailSpy,
       listUserStoredFiles: async () => [file],
       executeAccountPurgeRpc: rpcSpy,
+      listDueUsersForPurge: async () => [],
+      listExpiredAccountPurges: async () => [],
     };
     const baseFileRepo: FilePurgeWorkerRepository = {
       getFileForPurge: async () => file,
       markFilePendingPurge: async () => ({ ...file, purgeState: 'pending_purge' }),
-      countBlockingReferences: async () => 0,
+      acquireFilePurgeLeaseIfUnreferenced: async () => ({
+        status: 'acquired',
+        file: { ...file, purgeState: 'purging' },
+      }),
       acquireFilePurgeLease: async () => ({ ...file, purgeState: 'purging' }),
       markFilePurged: async () => {},
       markFilePurgeFailed: fileFailSpy,
       revertPendingPurgeToNone: async () => {},
+      listDueFilesForPurge: async () => [],
+      listExpiredPurgeLeases: async () => [],
     };
 
     // Case 1: markFilePendingPurge returns null -> must abort BEFORE touching Storage or DB RPC
@@ -699,6 +715,10 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
     expect(removeSpy).not.toHaveBeenCalled();
     expect(rpcSpy).not.toHaveBeenCalled();
     expect(userFailSpy).toHaveBeenCalledTimes(1);
+    expect(userFailSpy).toHaveBeenCalledWith('user-1', expect.stringMatching(/pending_purge/), {
+      expectedLeaseOwner: 'purge-worker',
+      expectedPurgeAttempts: 1,
+    });
 
     // Case 2: acquireFilePurgeLease returns null -> must abort BEFORE touching Storage or DB RPC
     userFailSpy.mockClear();
@@ -714,6 +734,10 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
     expect(removeSpy).not.toHaveBeenCalled();
     expect(rpcSpy).not.toHaveBeenCalled();
     expect(userFailSpy).toHaveBeenCalledTimes(1);
+    expect(userFailSpy).toHaveBeenCalledWith('user-1', expect.stringMatching(/lease busy/), {
+      expectedLeaseOwner: 'purge-worker',
+      expectedPurgeAttempts: 1,
+    });
 
     // Case 3: Storage verification returns false -> marks BOTH fileRepo & accountRepo failed, never runs DB RPC
     userFailSpy.mockClear();
@@ -729,9 +753,13 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
     ).rejects.toThrow(/remained present/);
     expect(fileFailSpy).toHaveBeenCalledWith('file-1', 'user-1', expect.stringMatching(/remained present/));
     expect(userFailSpy).toHaveBeenCalledTimes(1);
+    expect(userFailSpy).toHaveBeenCalledWith('user-1', expect.stringMatching(/remained present/), {
+      expectedLeaseOwner: 'purge-worker',
+      expectedPurgeAttempts: 1,
+    });
     expect(rpcSpy).not.toHaveBeenCalled();
 
-    // Case 4: Full success with mixed already_purged + active file using injected `now`
+    // Case 4: Full success with mixed already_purged + active file + retryable purge_failed file forwarding leaseSeconds
     const now = new Date('2026-10-16T12:00:00.000Z');
     const alreadyPurgedFile = makeFile({
       id: 'file-done',
@@ -740,8 +768,16 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
       purgedAt: new Date('2026-10-16T00:00:00.000Z'),
     });
     const activeFile = makeFile({ id: 'file-active' });
+    const failedRetryFile = makeFile({
+      id: 'file-failed',
+      purgeState: 'purge_failed',
+      purgeAttempts: 1,
+      lastPurgeError: 'transient s3 error',
+    });
     let activeIsPurged = false;
-    let recordedLeaseUntil: Date | undefined;
+    let failedIsPurged = false;
+    const markPendingCalledFor: string[] = [];
+    const recordedLeaseSeconds: Array<{ id: string; leaseSeconds: number }> = [];
 
     const successResult = await executeStorageFirstAccountPurge({
       userId: 'user-1',
@@ -754,29 +790,50 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
           activeIsPurged
             ? { ...activeFile, purgeState: 'purged', uploadStatus: 'deleted', purgedAt: now }
             : activeFile,
+          failedIsPurged
+            ? { ...failedRetryFile, purgeState: 'purged', uploadStatus: 'deleted', purgedAt: now }
+            : failedRetryFile,
         ],
       },
       fileRepo: {
         ...baseFileRepo,
-        acquireFilePurgeLease: async (id, _owner, leaseUntil) => {
-          recordedLeaseUntil = leaseUntil;
-          return { ...activeFile, id, purgeState: 'purging', purgeLeaseUntil: leaseUntil };
+        markFilePendingPurge: async (id) => {
+          markPendingCalledFor.push(id);
+          return { ...activeFile, id, purgeState: 'pending_purge' };
         },
-        markFilePurged: async () => {
-          activeIsPurged = true;
+        acquireFilePurgeLease: async (id, _owner, leaseSeconds) => {
+          recordedLeaseSeconds.push({ id, leaseSeconds });
+          const leaseUntil = new Date(now.getTime() + leaseSeconds * 1000);
+          const source = id === 'file-failed' ? failedRetryFile : activeFile;
+          return { ...source, id, purgeState: 'purging', purgeLeaseUntil: leaseUntil };
+        },
+        markFilePurged: async (id) => {
+          if (id === 'file-failed') {
+            failedIsPurged = true;
+          } else {
+            activeIsPurged = true;
+          }
         },
       },
       storage: { removeObject: async () => {}, verifyObjectAbsent: async () => true },
     });
 
-    expect(recordedLeaseUntil?.toISOString()).toBe('2026-10-16T12:01:30.000Z');
+    // purge_failed files must retry directly via acquireFilePurgeLease without triggering 23514 on markFilePendingPurge
+    expect(markPendingCalledFor).toEqual(['file-active']);
+    expect(recordedLeaseSeconds).toEqual([
+      { id: 'file-active', leaseSeconds: 90 },
+      { id: 'file-failed', leaseSeconds: 90 },
+    ]);
     expect(successResult).toEqual({
       userId: 'user-1',
-      purgedFileIds: ['file-active'],
+      purgedFileIds: ['file-active', 'file-failed'],
       alreadyPurgedFileIds: ['file-done'],
       databasePurgeExecuted: true,
     });
-    expect(rpcSpy).toHaveBeenCalledWith('user-1');
+    expect(rpcSpy).toHaveBeenCalledWith('user-1', {
+      expectedLeaseOwner: 'purge-worker',
+      expectedPurgeAttempts: 1,
+    });
 
     // Outbox helper completes external identity purge
     const outboxRes = await processExternalIdentityPurgeOutboxItem(
@@ -867,15 +924,23 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
           markUserPurgeFailed: async () => {},
           listUserStoredFiles: listFilesSpy,
           executeAccountPurgeRpc: rpcSpy,
+          listDueUsersForPurge: async () => [],
+          listExpiredAccountPurges: async () => [],
         },
         fileRepo: {
           getFileForPurge: async () => null,
           markFilePendingPurge: async () => null,
-          countBlockingReferences: async () => 0,
+          acquireFilePurgeLeaseIfUnreferenced: async () => ({
+            status: 'unavailable',
+            reason: 'not_found',
+            file: null,
+          }),
           acquireFilePurgeLease: async () => null,
           markFilePurged: async () => {},
           markFilePurgeFailed: async () => {},
           revertPendingPurgeToNone: async () => {},
+          listDueFilesForPurge: async () => [],
+          listExpiredPurgeLeases: async () => [],
         },
         storage: { removeObject: removeSpy, verifyObjectAbsent: async () => true },
       }),
@@ -884,6 +949,7 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
     expect(markPurgingSpy).toHaveBeenCalledWith({
       userId: 'user-1',
       leaseOwner: 'worker-42',
+      leaseSeconds: 120,
       leaseUntil: new Date('2026-10-16T00:02:00.000Z'),
     });
     expect(listFilesSpy).not.toHaveBeenCalled();
@@ -1429,17 +1495,31 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
     const statefulWorkerRepo: FilePurgeWorkerRepository = {
       getFileForPurge: async () => ({ ...dbRow }),
       markFilePendingPurge: async () => ({ ...dbRow, purgeState: 'pending_purge' }),
-      countBlockingReferences: async () => refCount,
-      acquireFilePurgeLease: async (_fileId, _owner, leaseUntil) => {
+      acquireFilePurgeLeaseIfUnreferenced: async (fileId, ownerUserId, leaseSeconds) => {
+        if (dbRow.id !== fileId || dbRow.ownerUserId !== ownerUserId) {
+          return { status: 'unavailable', reason: 'not_found', file: null };
+        }
+        if (refCount > 0) {
+          return { status: 'blocked_by_references', blockingReferences: refCount, file: { ...dbRow } };
+        }
         dbRow = {
           ...dbRow,
           purgeState: 'purging',
           purgeAttempts: dbRow.purgeAttempts + 1,
-          purgeLeaseUntil: leaseUntil,
+          purgeLeaseUntil: new Date(Date.now() + leaseSeconds * 1000),
+        };
+        return { status: 'acquired', file: { ...dbRow } };
+      },
+      acquireFilePurgeLease: async (_fileId, _owner, leaseSeconds) => {
+        dbRow = {
+          ...dbRow,
+          purgeState: 'purging',
+          purgeAttempts: dbRow.purgeAttempts + 1,
+          purgeLeaseUntil: new Date(Date.now() + leaseSeconds * 1000),
         };
         return { ...dbRow };
       },
-      markFilePurged: async (_fileId, _owner, now) => {
+      markFilePurged: async (_fileId, _owner, now = new Date()) => {
         dbRow = {
           ...dbRow,
           purgeState: 'purged',
@@ -1479,6 +1559,8 @@ describe('Storage-first deletion, account-purge orchestration, and lease recover
           purgeRequestedAt: null,
         };
       },
+      listDueFilesForPurge: async () => [],
+      listExpiredPurgeLeases: async () => [],
     };
 
     const storageAdapter: StorageObjectAdapter = {

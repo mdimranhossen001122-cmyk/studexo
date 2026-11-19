@@ -29,6 +29,20 @@
       "when": 1794627800000,
       "tag": "0003_studexo_schema_lockout_and_outbox_guard",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1794627810000,
+      "tag": "0004_fenced_account_purge",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1794627820000,
+      "tag": "0005_fenced_account_purge_equality",
+      "breakpoints": true
     }
   ]
 }
