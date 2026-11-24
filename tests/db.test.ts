@@ -764,18 +764,28 @@ describe('Studexo database implementation (Phase 8B.3B)', () => {
     const unconfiguredEnv = parseEnv({ NODE_ENV: 'test' });
     expect(getDatabaseConfigStatus(unconfiguredEnv)).toEqual({
       configured: false,
-      migrationsUrlConfigured: false,
       connected: false,
       poolMax: 5,
       idleTimeoutSeconds: 20,
       connectTimeoutSeconds: 10,
     });
+    expect(
+      'migrationsUrlConfigured' in
+        (getDatabaseConfigStatus(unconfiguredEnv) as unknown as Record<string, unknown>),
+    ).toBe(false);
 
     expect(() => getDb(unconfiguredEnv)).toThrow(DatabaseNotConfiguredError);
     expect(() => createRuntimeDbClient(unconfiguredEnv)).toThrow(DatabaseNotConfiguredError);
-    expect(() => getMigrationConnectionConfig(unconfiguredEnv)).toThrow(
-      DatabaseNotConfiguredError,
-    );
+    expect(() =>
+      getMigrationConnectionConfig({
+        runtime: { NODE_ENV: 'test', logLevel: 'silent' },
+        database: {
+          DIRECT_DATABASE_URL: '',
+          DB_IDLE_TIMEOUT_SECONDS: 20,
+          DB_CONNECT_TIMEOUT_SECONDS: 10,
+        },
+      }),
+    ).toThrow(DatabaseNotConfiguredError);
     expect(hasActiveDbClient()).toBe(false);
     expect(hasActiveWorkerDbClient()).toBe(false);
 
@@ -784,10 +794,14 @@ describe('Studexo database implementation (Phase 8B.3B)', () => {
     const configuredEnv = parseEnv({
       NODE_ENV: 'test',
       DATABASE_URL: `postgresql://studexo_app:${secretPassword}@127.0.0.1:6543/postgres`,
+    });
+    expect('DIRECT_DATABASE_URL' in configuredEnv.database).toBe(false);
+
+    const migrationEnvForConfig = parseMigrationEnv({
+      NODE_ENV: 'test',
       DIRECT_DATABASE_URL: `postgresql://studexo_migrator:${secretPassword}@127.0.0.1:5432/postgres`,
     });
-
-    const migrationCfg = getMigrationConnectionConfig(configuredEnv);
+    const migrationCfg = getMigrationConnectionConfig(migrationEnvForConfig);
     expect(JSON.stringify(migrationCfg)).not.toContain(secretPassword);
     expect(migrationCfg.migrationsSchema).toBe('drizzle');
     expect(migrationCfg.migrationsTable).toBe('__drizzle_migrations');
@@ -799,6 +813,8 @@ describe('Studexo database implementation (Phase 8B.3B)', () => {
     const workerEnv = parseWorkerEnv({
       NODE_ENV: 'test',
       WORKER_DATABASE_URL: `postgresql://studexo_purge_worker:${workerPassword}@127.0.0.1:6543/postgres`,
+      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'worker-test-service-role-key',
     });
     expect(getWorkerDb(workerEnv)).toBeDefined();
     expect(hasActiveWorkerDbClient()).toBe(true);

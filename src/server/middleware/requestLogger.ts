@@ -43,7 +43,9 @@ export function createRequestCompletionLogger(logger: Logger) {
         durationMs: Math.round(durationMs * 100) / 100,
       };
 
-      if (res.statusCode >= 500) {
+      if (safePath === '/api/ready' && res.statusCode === 503) {
+        logger.warn(logPayload, 'Readiness check returned degraded status');
+      } else if (res.statusCode >= 500) {
         logger.error(logPayload, 'HTTP request failed');
       } else if (res.statusCode >= 400) {
         logger.warn(logPayload, 'HTTP request completed with client error');

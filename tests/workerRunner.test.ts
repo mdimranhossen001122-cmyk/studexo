@@ -24,7 +24,10 @@ describe('Phase 8B.4E.1.2.2: Worker Shutdown Safety Hardening', () => {
   const dummyEnv: WorkerEnv = {
     runtime: { NODE_ENV: 'test', logLevel: 'silent' },
     database: { WORKER_DATABASE_URL: 'postgres://test:test@localhost:5432/test', DB_POOL_MAX: 2, WORKER_DB_POOL_MAX: 2, DB_IDLE_TIMEOUT_SECONDS: 10, DB_CONNECT_TIMEOUT_SECONDS: 5 },
-    supabase: {},
+    supabase: {
+      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+    },
   };
 
   const logger = createLogger('silent');

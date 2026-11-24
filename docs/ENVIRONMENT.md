@@ -19,8 +19,8 @@ Environment variables are validated at server startup in `src/server/config/env.
 | Variable | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | *(optional)* | PostgreSQL Supavisor transaction pooler URI (`:6543`, `studexo_app`) for runtime API Drizzle queries (`prepare: false`) |
-| `DIRECT_DATABASE_URL` | *(migration-required)* | Direct/session PostgreSQL URI (`:5432`, `studexo_migrator`) consumed exclusively by `db:migrate` (`src/server/db/migrate.ts` + `parseMigrationEnv()`, enforcing verified TLS + `DB_SSL_ROOT_CERT`); ignored by API/worker startup |
-| `WORKER_DATABASE_URL` | *(worker-required)* | Dedicated background worker PostgreSQL URI (`studexo_purge_worker`, `prepare: false`); ignored by API startup, required fail-closed via `parseWorkerEnv()` |
+| `DIRECT_DATABASE_URL` | *(migration-required)* | Direct/session PostgreSQL URI (`:5432`, `studexo_migrator`) consumed exclusively by `db:migrate` (`src/server/db/migrate.ts` + `parseMigrationEnv()`, enforcing verified TLS + `DB_SSL_ROOT_CERT`); excluded from `AppEnv`/`parseEnv()` and API/worker startup |
+| `WORKER_DATABASE_URL` | *(worker-required)* | Dedicated background worker PostgreSQL URI (`studexo_purge_worker`, `prepare: false`); ignored by API startup, required fail-closed via `parseWorkerEnv()` for `npm run build:worker` / `npm run start:worker` |
 | `WORKER_DB_POOL_MAX` | `2` | Maximum worker pool connections (`1..10`) |
 | `DB_SSL_ROOT_CERT` | *(optional)* | PEM-encoded X.509 CA bundle for PostgreSQL TLS certificate verification across API, worker, and `db:migrate` |
 | `DB_POOL_MAX` | `5` | Maximum runtime API pool connections (`1..20`) |
@@ -32,9 +32,9 @@ Note: `studexo_catalog_admin` remains `NOLOGIN` and `CATALOG_ADMIN_DATABASE_URL`
 ### 3. Optional Supabase (Server-Only + Public Client)
 | Variable | Exposure | Purpose |
 |---|---|---|
-| `SUPABASE_URL` | Server-only | Supabase project API URL |
+| `SUPABASE_URL` | Server-only | Supabase project API URL (optional on API; **required fail-closed** in `parseWorkerEnv()`, HTTPS mandatory in production) |
 | `SUPABASE_ANON_KEY` | Server-only | Supabase anon key |
-| `SUPABASE_SERVICE_ROLE_KEY` | **Server-only secret** | Privileged admin key (bypasses RLS; reserved for Storage/Auth Admin APIs; never expose to client) |
+| `SUPABASE_SERVICE_ROLE_KEY` | **Worker-only secret** | Privileged admin key (bypasses RLS; excluded from `AppEnv`/`parseEnv()`, **required fail-closed** in `parseWorkerEnv()` for worker Storage & Auth Admin APIs; never expose to client or API) |
 | `VITE_SUPABASE_URL` | Client-exposed | Public browser Supabase project URL |
 | `VITE_SUPABASE_ANON_KEY` | Client-exposed | Public browser publishable/anon key (safe only with RLS) |
 

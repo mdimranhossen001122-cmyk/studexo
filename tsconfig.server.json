@@ -17,5 +17,5 @@
     "src/shared/**/*.ts",
     "tests/**/*.ts"
   ],
-  "exclude": ["node_modules", "dist", "src/client"]
+  "exclude": ["node_modules", "dist", "src/client", "tests/client"]
 }

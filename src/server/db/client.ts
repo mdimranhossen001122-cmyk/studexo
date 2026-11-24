@@ -4,6 +4,7 @@ import postgres, { type Sql } from 'postgres';
 import {
   resolvePostgresTlsConfig,
   type AppEnv,
+  type MigrationEnv,
   type PostgresSslSetting,
   type WorkerEnv,
 } from '../config/env';
@@ -302,16 +303,16 @@ export async function checkDatabaseReadiness(
  * Validates that DIRECT_DATABASE_URL is configured for Drizzle Kit migrations (`studexo_migrator`)
  * without returning or logging the secret connection string.
  */
-export function getMigrationConnectionConfig(appEnv: AppEnv): MigrationConnectionConfig {
-  if (!appEnv.database.DIRECT_DATABASE_URL) {
+export function getMigrationConnectionConfig(migrationEnv: MigrationEnv): MigrationConnectionConfig {
+  if (!migrationEnv.database.DIRECT_DATABASE_URL) {
     throw new DatabaseNotConfiguredError(
       'Migration configuration requested, but DIRECT_DATABASE_URL is not configured.',
     );
   }
 
-  resolvePostgresTlsConfig(appEnv.database.DIRECT_DATABASE_URL, 'DIRECT_DATABASE_URL', {
-    isProduction: appEnv.runtime.NODE_ENV === 'production',
-    sslRootCert: appEnv.database.DB_SSL_ROOT_CERT,
+  resolvePostgresTlsConfig(migrationEnv.database.DIRECT_DATABASE_URL, 'DIRECT_DATABASE_URL', {
+    isProduction: migrationEnv.runtime.NODE_ENV === 'production',
+    sslRootCert: migrationEnv.database.DB_SSL_ROOT_CERT,
   });
 
   return {

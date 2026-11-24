@@ -157,11 +157,44 @@ const runtimeEnvSchema = z.object({
 const supabaseEnvSchema = z.object({
   SUPABASE_URL: optionalUrl,
   SUPABASE_ANON_KEY: optionalNonEmptyString,
-  SUPABASE_SERVICE_ROLE_KEY: optionalNonEmptyString,
   SUPABASE_JWT_SECRET: optionalNonEmptyString,
   SUPABASE_JWT_PUBLIC_KEY: optionalNonEmptyString,
   VITE_SUPABASE_URL: optionalUrl,
   VITE_SUPABASE_ANON_KEY: optionalNonEmptyString,
+});
+
+const requiredSupabaseUrl = z.preprocess(
+  emptyToUndefined,
+  z
+    .string({ error: 'SUPABASE_URL is required.' })
+    .trim()
+    .url('SUPABASE_URL must be a valid URL.')
+    .refine((val) => {
+      try {
+        const parsed = new URL(val);
+        return (
+          (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+          parsed.username === '' &&
+          parsed.password === ''
+        );
+      } catch {
+        return false;
+      }
+    }, 'SUPABASE_URL must be a valid http/https URL without embedded credentials.'),
+);
+
+const requiredNonEmptyString = (fieldName: string) =>
+  z.preprocess(
+    emptyToUndefined,
+    z
+      .string({ error: `${fieldName} is required.` })
+      .trim()
+      .min(1, `${fieldName} must not be empty.`),
+  );
+
+const workerSupabaseEnvSchema = z.object({
+  SUPABASE_URL: requiredSupabaseUrl,
+  SUPABASE_SERVICE_ROLE_KEY: requiredNonEmptyString('SUPABASE_SERVICE_ROLE_KEY'),
 });
 
 const poolTuningSchema = z.object({
@@ -182,7 +215,6 @@ const poolTuningSchema = z.object({
 
 const databaseEnvSchema = poolTuningSchema.extend({
   DATABASE_URL: optionalPostgresUrl,
-  DIRECT_DATABASE_URL: optionalPostgresUrl,
 });
 
 const workerDatabaseEnvSchema = poolTuningSchema.extend({
@@ -224,10 +256,7 @@ export interface WorkerEnv {
     logLevel: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'silent';
   };
   database: z.infer<typeof workerDatabaseEnvSchema>;
-  supabase: {
-    SUPABASE_URL?: string;
-    SUPABASE_SERVICE_ROLE_KEY?: string;
-  };
+  supabase: z.infer<typeof workerSupabaseEnvSchema>;
 }
 
 export interface MigrationEnv {
@@ -273,7 +302,7 @@ function parseTrustedHttpsOrigin(rawEntry: string): string {
 
 /**
  * Parses and validates runtime API server configuration.
- * Intentionally does NOT require `WORKER_DATABASE_URL` or initialize background worker credentials.
+ * Intentionally excludes `DIRECT_DATABASE_URL`, `WORKER_DATABASE_URL`, and `SUPABASE_SERVICE_ROLE_KEY`.
  */
 export function parseEnv(rawEnv: NodeJS.ProcessEnv = process.env): AppEnv {
   const runtime = runtimeEnvSchema.parse(rawEnv);
@@ -287,12 +316,6 @@ export function parseEnv(rawEnv: NodeJS.ProcessEnv = process.env): AppEnv {
   }
   if (database.DATABASE_URL) {
     resolvePostgresTlsConfig(database.DATABASE_URL, 'DATABASE_URL', {
-      isProduction,
-      sslRootCert: database.DB_SSL_ROOT_CERT,
-    });
-  }
-  if (database.DIRECT_DATABASE_URL) {
-    resolvePostgresTlsConfig(database.DIRECT_DATABASE_URL, 'DIRECT_DATABASE_URL', {
       isProduction,
       sslRootCert: database.DB_SSL_ROOT_CERT,
     });
@@ -347,18 +370,21 @@ export const parseApiEnv = parseEnv;
 
 /**
  * Parses and validates dedicated background purge worker configuration.
- * Fails closed whenever `WORKER_DATABASE_URL` is absent or violates TLS policy.
+ * Fails closed whenever `WORKER_DATABASE_URL`, `SUPABASE_URL`, or
+ * `SUPABASE_SERVICE_ROLE_KEY` is absent/invalid, or violates TLS/HTTPS policy.
  */
 export function parseWorkerEnv(rawEnv: NodeJS.ProcessEnv = process.env): WorkerEnv {
   const runtime = runtimeEnvSchema
     .pick({ NODE_ENV: true, LOG_LEVEL: true })
     .parse(rawEnv);
   const database = workerDatabaseEnvSchema.parse(rawEnv);
-  const supabase = supabaseEnvSchema
-    .pick({ SUPABASE_URL: true, SUPABASE_SERVICE_ROLE_KEY: true })
-    .parse(rawEnv);
+  const supabase = workerSupabaseEnvSchema.parse(rawEnv);
 
   const isProduction = runtime.NODE_ENV === 'production';
+  if (isProduction && new URL(supabase.SUPABASE_URL).protocol !== 'https:') {
+    throw new Error('SUPABASE_URL must use https: in production.');
+  }
+
   if (database.DB_SSL_ROOT_CERT) {
     normalizePemCertificate(database.DB_SSL_ROOT_CERT);
   }
@@ -426,9 +452,7 @@ export function getIntegrationReadiness(appEnv: AppEnv): ReadinessIntegrationFla
   return {
     runtimeConfigured: true,
     databaseConfigured: Boolean(appEnv.database.DATABASE_URL),
-    supabaseConfigured: Boolean(
-      supabaseUrl && supabaseAnon && appEnv.supabase.SUPABASE_SERVICE_ROLE_KEY,
-    ),
+    supabaseConfigured: Boolean(supabaseUrl && supabaseAnon),
     geminiConfigured: Boolean(appEnv.gemini.GEMINI_API_KEY),
   };
 }

@@ -23,7 +23,6 @@ export * from './schema/index';
 
 export interface DatabaseConfigStatus {
   configured: boolean;
-  migrationsUrlConfigured: boolean;
   connected: false;
   poolMax: number;
   idleTimeoutSeconds: number;
@@ -37,7 +36,6 @@ export interface DatabaseConfigStatus {
 export function getDatabaseConfigStatus(appEnv: AppEnv): DatabaseConfigStatus {
   return {
     configured: Boolean(appEnv.database.DATABASE_URL),
-    migrationsUrlConfigured: Boolean(appEnv.database.DIRECT_DATABASE_URL),
     connected: false as const,
     poolMax: appEnv.database.DB_POOL_MAX,
     idleTimeoutSeconds: appEnv.database.DB_IDLE_TIMEOUT_SECONDS,

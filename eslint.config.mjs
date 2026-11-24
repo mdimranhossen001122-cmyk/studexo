@@ -67,6 +67,7 @@ export default tseslint.config(
       'vitest.config.ts',
       'drizzle.config.ts',
     ],
+    ignores: ['tests/client/**'],
     languageOptions: {
       ecmaVersion: 2022,
       globals: globals.node,
@@ -84,6 +85,33 @@ export default tseslint.config(
               message: 'Server modules must not import browser client modules.',
             },
           ],
+        },
+      ],
+    },
+  },
+  {
+    files: ['tests/client/**/*.{ts,tsx}'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      globals: {
+        ...globals.browser,
+        ...globals.node,
+      },
+      parserOptions: {
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['**/src/server/**', '@server/*', '../server/*', '../../server/*', '**/server.ts'],
+              message: 'Client tests must not import server-only modules.',
+            },
+          ],
+          paths: SERVER_ONLY_RESTRICTED_IMPORTS.paths,
         },
       ],
     },

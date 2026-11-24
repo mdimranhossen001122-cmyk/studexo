@@ -23,6 +23,8 @@ import {
   createHealthRouter,
   type DatabaseReadinessProbe,
 } from './modules/health/health.routes';
+import { createStudentProfileRouter } from './modules/studentProfile/studentProfile.routes';
+import type { StudentProfileService } from './modules/studentProfile/studentProfile.service';
 
 export interface CreateAppOptions {
   env?: AppEnv;
@@ -32,6 +34,7 @@ export interface CreateAppOptions {
   rateLimitMax?: number;
   checkDatabaseReadiness?: DatabaseReadinessProbe;
   authDependencies?: AuthMiddlewareDependencies;
+  studentProfileService?: StudentProfileService;
 }
 
 export interface AppContext {
@@ -75,6 +78,14 @@ export function createApp(options: CreateAppOptions = {}): AppContext {
     }),
   );
   app.use('/api/auth', createAuthRouter({ authMiddleware }));
+  app.use(
+    '/api/student',
+    createStudentProfileRouter({
+      authMiddleware,
+      env,
+      studentProfileService: options.studentProfileService,
+    }),
+  );
   app.use('/api', apiRouter);
   app.use('/api', apiNotFoundHandler);
 

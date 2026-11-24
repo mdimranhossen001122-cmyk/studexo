@@ -31,14 +31,18 @@ async function main() {
     const accountRecoveryRepo = createPostgresAccountPurgeLeaseRecoveryRepository(db);
     const outboxRepo = createPostgresExternalIdentityOutboxRepository(db);
 
+    const isProduction = workerEnv.runtime.NODE_ENV === 'production';
+
     const storage = createSupabaseStorageObjectAdapter({
-      supabaseUrl: workerEnv.supabase.SUPABASE_URL ?? '',
-      serviceRoleKey: workerEnv.supabase.SUPABASE_SERVICE_ROLE_KEY ?? '',
+      supabaseUrl: workerEnv.supabase.SUPABASE_URL,
+      serviceRoleKey: workerEnv.supabase.SUPABASE_SERVICE_ROLE_KEY,
+      isProduction,
     });
 
     const authAdmin = createSupabaseAuthAdminAdapter({
-      supabaseUrl: workerEnv.supabase.SUPABASE_URL ?? '',
-      serviceRoleKey: workerEnv.supabase.SUPABASE_SERVICE_ROLE_KEY ?? '',
+      supabaseUrl: workerEnv.supabase.SUPABASE_URL,
+      serviceRoleKey: workerEnv.supabase.SUPABASE_SERVICE_ROLE_KEY,
+      isProduction,
     });
 
     runner = new WorkerRunner({

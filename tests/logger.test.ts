@@ -189,8 +189,14 @@ describe('Pino logger deep sanitization and query-string protection', () => {
       (l) => (l.req as Record<string, unknown> | undefined)?.path === '/api/ready',
     );
     expect(readyLog).toBeDefined();
+    expect(readyLog?.level).toBe(40);
     expect(readyLog?.requestId).toBe(degradedReadyRes.headers['x-request-id']);
     expect((readyLog?.res as Record<string, unknown>)?.statusCode).toBe(503);
     expect(typeof readyLog?.durationMs).toBe('number');
+
+    const explodeLog = logs.find(
+      (l) => (l.req as Record<string, unknown> | undefined)?.path === '/explode',
+    );
+    expect(explodeLog?.level).toBe(50);
   });
 });

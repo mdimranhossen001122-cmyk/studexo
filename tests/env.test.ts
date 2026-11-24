@@ -11,7 +11,8 @@ describe('Environment configuration (parseEnv)', () => {
     expect(env.runtime.allowedOrigins).toContain('http://localhost:3000');
     expect(env.runtime.cspFrameAncestors).toEqual([]);
     expect(env.database.DATABASE_URL).toBeUndefined();
-    expect(env.supabase.SUPABASE_SERVICE_ROLE_KEY).toBeUndefined();
+    expect('DIRECT_DATABASE_URL' in env.database).toBe(false);
+    expect('SUPABASE_SERVICE_ROLE_KEY' in env.supabase).toBe(false);
     expect(env.gemini.GEMINI_API_KEY).toBeUndefined();
 
     const readiness = getIntegrationReadiness(env);
@@ -42,13 +43,12 @@ describe('Environment configuration (parseEnv)', () => {
     expect(env.gemini.GEMINI_API_KEY).toBeUndefined();
   });
 
-  it('marks integrations as configured when valid optional credentials are supplied', () => {
+  it('marks integrations as configured when valid optional API credentials are supplied without service-role key', () => {
     const env = parseEnv({
       NODE_ENV: 'test',
       DATABASE_URL: 'postgresql://user:pass@localhost:6543/postgres',
       SUPABASE_URL: 'https://example.supabase.co',
       SUPABASE_ANON_KEY: 'anon-placeholder',
-      SUPABASE_SERVICE_ROLE_KEY: 'service-role-placeholder',
       GEMINI_API_KEY: 'gemini-placeholder',
     });
 
@@ -58,6 +58,70 @@ describe('Environment configuration (parseEnv)', () => {
       supabaseConfigured: true,
       geminiConfigured: true,
     });
+  });
+
+  it('strips SUPABASE_SERVICE_ROLE_KEY from AppEnv and keeps API readiness decoupled from it while retaining it in parseWorkerEnv', async () => {
+    const { parseApiEnv, parseWorkerEnv } = await import('../src/server/config/env');
+
+    const apiEnvWithInjectedSecret = parseApiEnv({
+      NODE_ENV: 'production',
+      SUPABASE_SERVICE_ROLE_KEY: 'service-role-should-never-enter-app-env',
+    });
+    expect('SUPABASE_SERVICE_ROLE_KEY' in apiEnvWithInjectedSecret.supabase).toBe(false);
+    expect(
+      (apiEnvWithInjectedSecret.supabase as Record<string, unknown>).SUPABASE_SERVICE_ROLE_KEY,
+    ).toBeUndefined();
+    expect(getIntegrationReadiness(apiEnvWithInjectedSecret).supabaseConfigured).toBe(false);
+
+    const apiEnvWithViteFallback = parseEnv({
+      NODE_ENV: 'test',
+      VITE_SUPABASE_URL: 'https://example.supabase.co',
+      VITE_SUPABASE_ANON_KEY: 'vite-anon-placeholder',
+    });
+    expect(getIntegrationReadiness(apiEnvWithViteFallback).supabaseConfigured).toBe(true);
+
+    const apiEnvMissingAnon = parseEnv({
+      NODE_ENV: 'test',
+      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'service-role-does-not-satisfy-api-auth',
+    });
+    expect(getIntegrationReadiness(apiEnvMissingAnon).supabaseConfigured).toBe(false);
+
+    const workerEnv = parseWorkerEnv({
+      NODE_ENV: 'production',
+      WORKER_DATABASE_URL: 'postgresql://studexo_purge_worker:pw@db.example.com:6543/postgres',
+      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'worker-service-role-key',
+    });
+    expect(workerEnv.supabase).toEqual({
+      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'worker-service-role-key',
+    });
+
+    // Worker startup fails closed when SUPABASE_SERVICE_ROLE_KEY or SUPABASE_URL is missing/blank
+    expect(() =>
+      parseWorkerEnv({
+        NODE_ENV: 'production',
+        WORKER_DATABASE_URL: 'postgresql://studexo_purge_worker:pw@db.example.com:6543/postgres',
+        SUPABASE_URL: 'https://example.supabase.co',
+        SUPABASE_SERVICE_ROLE_KEY: '   ',
+      }),
+    ).toThrow();
+    expect(() =>
+      parseWorkerEnv({
+        NODE_ENV: 'production',
+        WORKER_DATABASE_URL: 'postgresql://studexo_purge_worker:pw@db.example.com:6543/postgres',
+        SUPABASE_SERVICE_ROLE_KEY: 'worker-service-role-key',
+      }),
+    ).toThrow();
+    expect(() =>
+      parseWorkerEnv({
+        NODE_ENV: 'production',
+        WORKER_DATABASE_URL: 'postgresql://studexo_purge_worker:pw@db.example.com:6543/postgres',
+        SUPABASE_URL: 'http://example.supabase.co',
+        SUPABASE_SERVICE_ROLE_KEY: 'worker-service-role-key',
+      }),
+    ).toThrow(/https:/i);
   });
 
   it('accepts explicit HTTPS origins in CSP_FRAME_ANCESTORS and rejects wildcards or HTTP', () => {
@@ -82,10 +146,18 @@ describe('Environment configuration (parseEnv)', () => {
     expect(() => parseEnv({ CSP_FRAME_ANCESTORS: 'not-a-url' })).toThrow();
   });
 
-  it('rejects invalid PORT, malformed DATABASE_URL, out-of-range DB pool limits, and invalid ALLOWED_ORIGINS', () => {
+  it('rejects invalid PORT, malformed DATABASE_URL, out-of-range DB pool limits, and invalid ALLOWED_ORIGINS while ignoring DIRECT_DATABASE_URL in parseEnv', () => {
     expect(() => parseEnv({ PORT: '99999' })).toThrow();
     expect(() => parseEnv({ DATABASE_URL: 'http://not-postgres' })).toThrow();
-    expect(() => parseEnv({ DIRECT_DATABASE_URL: 'mysql://localhost/db' })).toThrow();
+    const apiEnvWithDirectUrl = parseEnv({
+      NODE_ENV: 'production',
+      DIRECT_DATABASE_URL: 'mysql://localhost/db',
+      SUPABASE_SERVICE_ROLE_KEY: 'should-not-enter-app-env',
+    });
+    expect('DIRECT_DATABASE_URL' in apiEnvWithDirectUrl.database).toBe(false);
+    expect(
+      (apiEnvWithDirectUrl.database as Record<string, unknown>).DIRECT_DATABASE_URL,
+    ).toBeUndefined();
     expect(() => parseEnv({ DB_POOL_MAX: '0' })).toThrow();
     expect(() => parseEnv({ DB_POOL_MAX: '100' })).toThrow();
     expect(() => parseEnv({ DB_IDLE_TIMEOUT_SECONDS: '1' })).toThrow();
@@ -96,7 +168,7 @@ describe('Environment configuration (parseEnv)', () => {
   it('isolates API env from worker DB requirements while failing closed in parseWorkerEnv', async () => {
     const { parseApiEnv, parseWorkerEnv } = await import('../src/server/config/env');
 
-    // API startup succeeds cleanly without WORKER_DATABASE_URL
+    // API startup succeeds cleanly without WORKER_DATABASE_URL, DIRECT_DATABASE_URL, or SUPABASE_SERVICE_ROLE_KEY
     const apiEnv = parseApiEnv({
       NODE_ENV: 'production',
       APP_URL: 'https://studexo.example.com',
@@ -107,13 +179,20 @@ describe('Environment configuration (parseEnv)', () => {
     // Worker startup fails closed if WORKER_DATABASE_URL is omitted or blank
     expect(() => parseWorkerEnv({ NODE_ENV: 'production' })).toThrow();
     expect(() =>
-      parseWorkerEnv({ NODE_ENV: 'production', WORKER_DATABASE_URL: '   ' }),
+      parseWorkerEnv({
+        NODE_ENV: 'production',
+        WORKER_DATABASE_URL: '   ',
+        SUPABASE_URL: 'https://example.supabase.co',
+        SUPABASE_SERVICE_ROLE_KEY: 'worker-service-role-key',
+      }),
     ).toThrow();
 
     const workerEnv = parseWorkerEnv({
       NODE_ENV: 'production',
       WORKER_DATABASE_URL: 'postgresql://studexo_purge_worker:pw@db.example.com:6543/postgres',
       WORKER_DB_POOL_MAX: '3',
+      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'worker-service-role-key',
     });
     expect(workerEnv.database.WORKER_DB_POOL_MAX).toBe(3);
     expect(workerEnv.database.WORKER_DATABASE_URL).toContain('studexo_purge_worker');
@@ -135,6 +214,8 @@ describe('Environment configuration (parseEnv)', () => {
         parseWorkerEnv({
           NODE_ENV: 'production',
           WORKER_DATABASE_URL: `postgresql://studexo_purge_worker:pw@db.example.com:6543/postgres?sslmode=${badMode}`,
+          SUPABASE_URL: 'https://example.supabase.co',
+          SUPABASE_SERVICE_ROLE_KEY: 'worker-service-role-key',
         }),
       ).toThrow(/insecure sslmode/i);
     }
